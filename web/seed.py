@@ -115,17 +115,22 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
     }
     registry.store("suites").insert(suite)
 
-    registry.store("schedules").insert({
-        "id": new_id("sch"),
+    # 单元测试套件：纯脚本/断言类用例（静态、单元阶段绑定它）
+    suite_unit = {
+        "id": new_id("suite"),
         "project_id": pid,
-        "name": "每 10 分钟跑一次冒烟",
-        "cron": "*/10 * * * *",
-        "suite_id": suite["id"],
+        "name": "单元测试套件",
+        "description": "脚本与断言类单元用例",
+        "group": "unit",
         "env_id": env["id"],
-        "enabled": False,
-        "last_fired_minute": None,
+        "case_ids": [c7, c8],
         "created_at": time.time(),
-    })
+    }
+    registry.store("suites").insert(suite_unit)
+
+    # -- 静态检查规则（流水线第一阶段使用） -------------------------------
+    from engine.staticcheck import DEFAULT_NAME_PATTERN
+    rules_store = registry.store("static_rules")
 
     notify_mgr.create(pid, {
         "type": "webhook",
@@ -140,4 +145,104 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "events": ["build.failed"],
     })
 
-    return {"project": proj, "env_id": env["id"], "suite_id": suite["id"]}
+    # -- 静态检查规则（流水线第一阶段使用） -------------------------------
+    from engine.staticcheck import DEFAULT_NAME_PATTERN
+    rules_store = registry.store("static_rules")
+    rule_specs = [
+        ("用例命名非空", "name_not_empty", "error", {}),
+        ("至少包含一个步骤", "steps_not_empty", "error", {}),
+        ("必须包含断言", "must_have_assert", "error", {}),
+        ("命名规范（中英文/数字/连接符）", "naming_convention", "warning",
+         {"pattern": DEFAULT_NAME_PATTERN}),
+        ("禁止硬编码域名", "no_hardcoded_url", "warning", {}),
+        ("步骤数不超过 20", "max_steps", "warning", {"max_steps": 20}),
+    ]
+    for rname, rtype, level, extra in rule_specs:
+        rules_store.insert({
+            "id": new_id("rule"),
+            "project_id": pid,
+            "name": rname,
+            "description": "演示内置静态规则",
+            "type": rtype,
+            "level": level,
+            "pattern": extra.get("pattern", ""),
+            "max_steps": extra.get("max_steps", 20),
+            "enabled": True,
+            "builtin": True,
+            "created_at": time.time(),
+        })
+
+    # -- 标准四阶段流水线：静态检查 → 单元测试 → 接口回归 → 报告生成 -------
+    # 环境编排：开发环境（dev）先跑，预发环境（staging）后跑。
+    # - 静态检查 / 单元测试：失败后「继续跑但标记结果」（continue）；
+    # - 接口回归：失败「直接中止」（abort），冒烟套件内含失败注入用例，
+    #   dev 就会失败并中止，能直观看到预发不再执行；
+    # - 报告生成：收尾阶段，即使中止也照常产出汇总报告。
+    pipeline = {
+        "id": new_id("pipe"),
+        "project_id": pid,
+        "name": "标准回归流水线",
+        "description": "静态检查 → 单元测试 → 接口回归（dev→staging）→ 报告",
+        "env_ids": [env["id"], env2["id"]],
+        "enabled": True,
+        "stages": [
+            {
+                "id": new_id("stg"),
+                "name": "静态检查",
+                "type": "static",
+                "on_fail": "continue",
+                "env_scope": "pipeline",
+                "suite_id": None,
+                "tags_any": [],
+                "env_id": None,
+            },
+            {
+                "id": new_id("stg"),
+                "name": "单元测试",
+                "type": "unit",
+                "on_fail": "continue",
+                "env_scope": "pipeline",
+                "suite_id": suite_unit["id"],
+                "tags_any": [],
+                "env_id": None,
+            },
+            {
+                "id": new_id("stg"),
+                "name": "接口回归",
+                "type": "api",
+                "on_fail": "abort",
+                "env_scope": "pipeline",
+                "suite_id": suite["id"],
+                "tags_any": [],
+                "env_id": None,
+            },
+            {
+                "id": new_id("stg"),
+                "name": "生成报告",
+                "type": "report",
+                "on_fail": "continue",
+                "env_scope": "once",
+                "suite_id": None,
+                "tags_any": [],
+                "env_id": None,
+            },
+        ],
+        "created_at": time.time(),
+    }
+    registry.store("pipelines").insert(pipeline)
+
+    registry.store("schedules").insert({
+        "id": new_id("sch"),
+        "project_id": pid,
+        "name": "每 10 分钟跑一次阶段流水线",
+        "cron": "*/10 * * * *",
+        "pipeline_id": pipeline["id"],
+        "suite_id": None,
+        "env_id": None,
+        "enabled": False,
+        "last_fired_minute": None,
+        "created_at": time.time(),
+    })
+
+    return {"project": proj, "env_id": env["id"], "suite_id": suite["id"],
+            "pipeline_id": pipeline["id"]}

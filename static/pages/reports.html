@@ -95,12 +95,13 @@ async function loadTrend() {
 
 async function loadBuilds() {
   const d = await api(`/api/builds?project_id=${projectId}`);
-  builds = d.builds || [];
+  builds = (d.builds || []).filter(b => b.kind !== "stage");
   const host = $("#build-list");
   if (!builds.length) { host.innerHTML = '<div class="empty">暂无构建</div>'; return; }
   host.innerHTML = builds.map(b => `
     <div class="build-item ${b.id===currentBuild?'active':''}" onclick="selectBuild('${b.id}')">
-      <div class="row spread"><strong>${esc(b.name||b.id)}</strong>${statusBadge(b.status)}</div>
+      <div class="row spread"><strong>${esc(b.name||b.id)}</strong>
+        <span class="row">${b.kind==='pipeline'?'<span class="kind-tag" style="font-size:11px;padding:1px 8px;border-radius:999px;background:#f3e8ff;color:var(--violet);margin-right:4px">流水线</span>':""}${statusBadge(b.status)}</span></div>
       <div class="muted" style="font-size:12px">通过 ${b.passed||0}/${b.total||0} · ${fmtDur(b.duration)} · ${fmtTime(b.finished_at)}</div>
     </div>`).join("");
 }
@@ -120,6 +121,7 @@ function renderReport(r) {
   const prio = Object.entries(r.by_priority || {});
   const failures = r.failures || [];
   const slowest = r.slowest || [];
+  const stageSummaries = r.stages || [];
 
   $("#report-body").innerHTML = `
     <div class="grid cols-4 mt">
@@ -131,7 +133,19 @@ function renderReport(r) {
     <div class="mt row">
       ${statusBadge(r.status)}
       <span class="muted" style="font-size:13px">触发 ${esc(r.trigger||'manual')} · ${fmtTime(r.started_at)} → ${fmtTime(r.finished_at)}</span>
+      ${r.kind === "pipeline" ? '<a class="btn small secondary" href="/page/monitor.html?build_id='+encodeURIComponent(r.build_id)+'">查看流水线 →</a>' : ""}
     </div>
+
+    ${stageSummaries.length ? `<div class="mt"><h3>阶段汇总</h3>
+      <table><thead><tr><th>#</th><th>阶段</th><th>类型</th><th>状态</th><th>各环境尝试</th><th>通过</th><th>耗时</th></tr></thead>
+      <tbody>${stageSummaries.map((st, i) => `<tr>
+        <td>${i+1}</td><td><strong>${esc(st.name)}</strong></td>
+        <td><span class="tag">${STAGE_TYPE_LABELS[st.type]||st.type}</span></td>
+        <td>${statusBadge(st.status)}</td>
+        <td style="font-size:12px">${(st.attempts||[]).map(a =>
+          `${esc(a.env_name||"汇总")}:${STATUS_LABELS[a.status]||a.status}(${fmtDur(a.duration)})`).join(" · ")}</td>
+        <td>${st.passed}/${st.total}</td><td>${fmtDur(st.duration)}</td>
+      </tr>`).join("")}</tbody></table></div>` : ""}
     <div class="mt grid cols-4">
       <div class="stat"><div class="v">${fmtDur(d.avg)}</div><div class="k">平均耗时</div></div>
       <div class="stat"><div class="v">${fmtDur(d.median)}</div><div class="k">中位耗时</div></div>

@@ -57,6 +57,10 @@ def _notify():
     return current_app.config["NOTIFY"]
 
 
+def _static():
+    return current_app.config["STATIC_CHECKER"]
+
+
 def _payload() -> dict:
     return request.get_json(silent=True) or {}
 
@@ -92,7 +96,11 @@ def list_projects():
         p = dict(p)
         p["case_count"] = len(cases_store.query(where=[("project_id", "eq", pid)]))
         p["suite_count"] = len(suites_store.query(where=[("project_id", "eq", pid)]))
-        p["build_count"] = len(_builds().for_project(pid).list_builds())
+        p["pipeline_count"] = len(_store("pipelines").query(where=[("project_id", "eq", pid)]))
+        # 阶段子构建并入父流水线统计，不单独计数
+        p["build_count"] = sum(
+            1 for b in _builds().for_project(pid).list_builds()
+            if b.get("kind") != "stage")
         out.append(p)
     return jsonify({"projects": out})
 
@@ -346,6 +354,176 @@ def run_suite(suite_id: str):
     return jsonify(result)
 
 
+# ---------------------------------------------------------------------------
+# 阶段流水线：编排 / 触发 / 阶段状态
+# ---------------------------------------------------------------------------
+
+_STAGE_FIELDS = ("id", "name", "type", "on_fail", "env_scope",
+                 "suite_id", "tags_any", "env_id")
+
+
+def _normalize_stages(raw, project_id: str):
+    """校验并归一化前端提交的阶段定义。"""
+    if not isinstance(raw, list) or not raw:
+        return None, "至少需要一个阶段"
+    stages = []
+    seen_report = False
+    for i, st in enumerate(raw):
+        if not isinstance(st, dict):
+            return None, f"第 {i + 1} 个阶段格式不正确"
+        stype = st.get("type", "api")
+        if stype not in ("static", "unit", "api", "report"):
+            return None, f"第 {i + 1} 个阶段类型无效: {stype}"
+        on_fail = st.get("on_fail", "abort")
+        if on_fail not in ("abort", "continue"):
+            return None, f"第 {i + 1} 个阶段失败策略无效"
+        env_scope = st.get("env_scope", "pipeline")
+        if env_scope not in ("once", "pipeline", "fixed"):
+            return None, f"第 {i + 1} 个阶段环境编排方式无效"
+        if stype == "report":
+            env_scope = "once"
+            seen_report = True
+        norm = {
+            "id": st.get("id") or new_id("stg"),
+            "name": (st.get("name") or "").strip() or f"阶段{i + 1}",
+            "type": stype,
+            "on_fail": on_fail,
+            "env_scope": env_scope,
+            "suite_id": st.get("suite_id") or None,
+            "tags_any": st.get("tags_any") or [],
+            "env_id": st.get("env_id") or None,
+        }
+        if env_scope == "fixed" and not norm["env_id"]:
+            return None, f"阶段「{norm['name']}」设为固定环境但未选择环境"
+        stages.append(norm)
+    return stages, None
+
+
+def _enrich_pipeline(p: dict) -> dict:
+    """附上阶段绑定的套件名与环境名，方便页面直接展示。"""
+    p = dict(p)
+    suites = {s["id"]: s for s in _store("suites")
+              .query(where=[("project_id", "eq", p["project_id"])])}
+    envs = {e["id"]: e for e in _env_mgr().list(p["project_id"])}
+    p["env_names"] = [envs[eid]["name"] for eid in (p.get("env_ids") or []) if eid in envs]
+    for st in p.get("stages", []):
+        suite = suites.get(st.get("suite_id"))
+        st["suite_name"] = suite.get("name") if suite else None
+        env = envs.get(st.get("env_id"))
+        st["env_name"] = env.get("name") if env else None
+        st["case_count"] = len(suite.get("case_ids") or []) if suite else 0
+    p["stage_count"] = len(p.get("stages") or [])
+    return p
+
+
+@api.get("/projects/<project_id>/pipelines")
+def list_pipelines(project_id: str):
+    pipelines = _store("pipelines").query(where=[("project_id", "eq", project_id)],
+                                          order_by="created_at", order="desc")
+    return jsonify({"pipelines": [_enrich_pipeline(p) for p in pipelines]})
+
+
+@api.post("/projects/<project_id>/pipelines")
+def create_pipeline(project_id: str):
+    data = _payload()
+    name = (data.get("name") or "").strip()
+    if not name:
+        return _err("流水线名称不能为空")
+    stages, err = _normalize_stages(data.get("stages"), project_id)
+    if err:
+        return _err(err)
+    env_ids = data.get("env_ids") or []
+    valid_env_ids = {e["id"] for e in _env_mgr().list(project_id)}
+    env_ids = [eid for eid in env_ids if eid in valid_env_ids]
+    pipeline = {
+        "id": new_id("pipe"),
+        "project_id": project_id,
+        "name": name,
+        "description": data.get("description", ""),
+        "env_ids": env_ids,
+        "stages": stages,
+        "enabled": bool(data.get("enabled", True)),
+        "created_at": time.time(),
+    }
+    _store("pipelines").insert(pipeline)
+    return jsonify(_enrich_pipeline(pipeline))
+
+
+@api.get("/pipelines/<pipeline_id>")
+def get_pipeline(pipeline_id: str):
+    p = _store("pipelines").get(pipeline_id)
+    if p is None:
+        return _err("流水线不存在", 404)
+    return jsonify(_enrich_pipeline(p))
+
+
+@api.put("/pipelines/<pipeline_id>")
+def update_pipeline(pipeline_id: str):
+    p = _store("pipelines").get(pipeline_id)
+    if p is None:
+        return _err("流水线不存在", 404)
+    data = _payload()
+    patch = {k: data[k] for k in ("name", "description", "env_ids", "enabled")
+             if k in data}
+    if "stages" in data:
+        stages, err = _normalize_stages(data["stages"], p["project_id"])
+        if err:
+            return _err(err)
+        patch["stages"] = stages
+    updated = _store("pipelines").update(pipeline_id, patch)
+    return jsonify(_enrich_pipeline(updated))
+
+
+@api.delete("/pipelines/<pipeline_id>")
+def delete_pipeline(pipeline_id: str):
+    _store("pipelines").delete(pipeline_id)
+    return jsonify({"ok": True})
+
+
+@api.post("/pipelines/<pipeline_id>/run")
+def run_pipeline(pipeline_id: str):
+    p = _store("pipelines").get(pipeline_id)
+    if p is None:
+        return _err("流水线不存在", 404)
+    result = _scheduler().submit_pipeline(
+        p["project_id"], pipeline_id,
+        trigger=(_payload() or {}).get("trigger", "manual"))
+    if "id" not in result:
+        return _err(result.get("error", "提交流水线失败"))
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# 静态检查规则
+# ---------------------------------------------------------------------------
+
+@api.get("/projects/<project_id>/static-rules")
+def list_static_rules(project_id: str):
+    return jsonify({"rules": _static().list_rules(project_id)})
+
+
+@api.post("/projects/<project_id>/static-rules")
+def create_static_rule(project_id: str):
+    data = _payload()
+    if not (data.get("name") or "").strip():
+        return _err("规则名称不能为空")
+    return jsonify(_static().create_rule(project_id, data))
+
+
+@api.put("/static-rules/<rule_id>")
+def update_static_rule(rule_id: str):
+    updated = _static().update_rule(rule_id, _payload())
+    if updated is None:
+        return _err("规则不存在", 404)
+    return jsonify(updated)
+
+
+@api.delete("/static-rules/<rule_id>")
+def delete_static_rule(rule_id: str):
+    _static().delete_rule(rule_id)
+    return jsonify({"ok": True})
+
+
 @api.post("/builds/<build_id>/cancel")
 def cancel_build(build_id: str):
     result = _scheduler().cancel_build(build_id)
@@ -397,6 +575,40 @@ def build_results(build_id: str):
                             order_by=request.args.get("order_by") or "order",
                             order=order, limit=limit, offset=offset)
     return jsonify({"build_id": build_id, "count": len(records), "results": records})
+
+
+@api.get("/builds/<build_id>/stages")
+def build_stages(build_id: str):
+    """流水线父构建的阶段运行态 + 阶段子构建列表（可视化用）。"""
+    build, err = _build_or_404(build_id)
+    if err:
+        return err
+    store = _builds().for_project(build["project_id"])
+    children = store.list_children(build_id)
+    return jsonify({
+        "build_id": build_id,
+        "kind": build.get("kind", "build"),
+        "pipeline_id": build.get("pipeline_id"),
+        "stages": build.get("stages", []),
+        "children": [{
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "status": c.get("status"),
+            "env_id": c.get("env_id"),
+            "env_name": c.get("env_name"),
+            "stage_id": c.get("stage_id"),
+            "stage_attempt_id": c.get("stage_attempt_id"),
+            "total": c.get("total", 0),
+            "passed": c.get("passed", 0),
+            "failed": c.get("failed", 0),
+            "error": c.get("error", 0),
+            "timeout": c.get("timeout", 0),
+            "skipped": c.get("skipped", 0),
+            "duration": c.get("duration", 0.0),
+            "started_at": c.get("started_at"),
+            "finished_at": c.get("finished_at"),
+        } for c in children],
+    })
 
 
 @api.get("/builds/<build_id>/logs")
@@ -590,12 +802,15 @@ def create_schedule(project_id: str):
         parse_cron(cron)
     except ValueError as exc:
         return _err(str(exc))
+    if not data.get("pipeline_id") and not data.get("suite_id"):
+        return _err("请选择要定时执行的套件或流水线")
     schedule = {
         "id": new_id("sch"),
         "project_id": project_id,
         "name": data.get("name", "定时任务"),
         "cron": cron,
         "suite_id": data.get("suite_id"),
+        "pipeline_id": data.get("pipeline_id"),
         "env_id": data.get("env_id"),
         "enabled": bool(data.get("enabled", True)),
         "last_fired_minute": None,
@@ -612,7 +827,8 @@ def update_schedule(schedule_id: str):
     if sched is None:
         return _err("定时任务不存在", 404)
     data = _payload()
-    patch = {k: data[k] for k in ("name", "cron", "suite_id", "env_id", "enabled")
+    patch = {k: data[k] for k in ("name", "cron", "suite_id", "pipeline_id",
+                                  "env_id", "enabled")
              if k in data}
     if "cron" in patch:
         from engine.cron import parse_cron

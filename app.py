@@ -21,7 +21,7 @@ if BASE_DIR not in sys.path:
 
 from engine import (Scheduler, TestExecutor, EnvironmentManager,          # noqa: E402
                     CoverageAnalyzer, ReportGenerator, DefectManager,
-                    NotificationManager)
+                    NotificationManager, StaticChecker)
 from storage import StoreRegistry, BuildStoreRegistry                       # noqa: E402
 from web import api                                                         # noqa: E402
 from web.seed import seed_demo_data                                         # noqa: E402
@@ -45,9 +45,10 @@ def create_app(data_root: str | None = None) -> Flask:
     report_gen = ReportGenerator(build_registry)
     defects = DefectManager(registry)
     notify = NotificationManager(registry)
+    static_checker = StaticChecker(registry)
     scheduler = Scheduler(
         registry, build_registry, executor, env_manager,
-        report_gen, coverage, defects, notify,
+        report_gen, coverage, defects, notify, static_checker,
         max_build_workers=4, max_case_workers=8, tick_seconds=20,
     )
 
@@ -61,6 +62,7 @@ def create_app(data_root: str | None = None) -> Flask:
     app.config["REPORT_GEN"] = report_gen
     app.config["DEFECTS"] = defects
     app.config["NOTIFY"] = notify
+    app.config["STATIC_CHECKER"] = static_checker
     app.config["JSON_AS_ASCII"] = False
 
     app.register_blueprint(api)
@@ -76,13 +78,19 @@ def create_app(data_root: str | None = None) -> Flask:
             name = name + ".html"
         return send_from_directory(os.path.join(BASE_DIR, "static", "pages"), name)
 
-    # -- 首次启动：无数据则自动生成演示数据并触发一次构建 --------------------
-    # 让各页面一打开就有内容可点、可测，报告/覆盖率/缺陷/监控也有初始数据。
+    # -- 首次启动：无数据则自动生成演示数据并触发一条流水线 ------------------
+    # 让各页面一打开就有内容可点、可测：流水线页/监控页能看到四阶段
+    # （静态检查→单元→接口回归→报告）在 dev→staging 两个环境上的运行态。
     if not registry.store("projects").all():
         seeded = seed_demo_data(registry, env_manager, notify)
         try:
-            scheduler.submit_build(
-                seeded["project"]["id"], seeded["suite_id"], trigger="auto_seed")
+            if seeded.get("pipeline_id"):
+                scheduler.submit_pipeline(
+                    seeded["project"]["id"], seeded["pipeline_id"],
+                    trigger="auto_seed")
+            else:
+                scheduler.submit_build(
+                    seeded["project"]["id"], seeded["suite_id"], trigger="auto_seed")
         except Exception:  # noqa: BLE001
             pass
 

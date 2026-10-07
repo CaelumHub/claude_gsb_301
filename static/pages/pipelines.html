@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>流水线编排 - 自动化测试与持续集成平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .bind-line { font-size: 12.5px; color: var(--text-muted); margin-top: 6px; }
+    .env-flow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">流水线编排</h1>
+    <p class="page-desc">把一次完整验证拆成有序阶段：静态检查 → 单元测试 → 接口回归 → 报告生成；
+      前一阶段通过才进入下一阶段，失败可「直接中止」或「继续跑但标记」，并支持多环境顺序编排（开发先跑、预发后跑）。</p>
+
+    <div class="card">
+      <div class="row">
+        <label style="margin:0 6px 0 0;align-self:center">项目</label>
+        <select id="project-select" style="max-width:260px" onchange="switchProject(this.value)"></select>
+        <span style="flex:1"></span>
+        <button class="btn secondary" id="btn-rules">静态检查规则</button>
+        <button class="btn" id="btn-new">新建流水线</button>
+      </div>
+    </div>
+
+    <section class="card" id="list-card">
+      <h2>流水线列表</h2>
+      <div id="pipeline-list"><div class="empty">加载中…</div></div>
+    </section>
+
+    <!-- 最近一次运行的阶段轨道 -->
+    <section class="card" id="latest-card" style="display:none">
+      <div class="row spread">
+        <h2 style="margin:0" id="latest-title">最近运行</h2>
+        <a class="btn small secondary" id="latest-link" href="#">在执行监控中查看 →</a>
+      </div>
+      <div class="mt" id="latest-rail"></div>
+    </section>
+
+    <!-- 新建/编辑流水线 -->
+    <section class="card" id="edit-card" style="display:none">
+      <h2 id="edit-title">新建流水线</h2>
+      <div class="grid cols-2">
+        <div><label>流水线名称 *</label><input type="text" id="p-name" placeholder="标准回归流水线"></div>
+        <div>
+          <label>环境编排（按顺序执行，可拖动上下调整）</label>
+          <div class="env-order" id="env-order"><div class="muted" style="font-size:13px">加载环境…</div></div>
+        </div>
+      </div>
+      <div class="mt"><label>描述</label><textarea id="p-desc" style="min-height:48px"></textarea></div>
+
+      <div class="row spread mt mb">
+        <h3 style="margin:0">阶段（自上而下顺序执行）</h3>
+        <button class="btn small secondary" id="btn-add-stage" type="button">+ 添加阶段</button>
+      </div>
+      <div id="stage-list"></div>
+
+      <div class="row mt">
+        <button class="btn" id="btn-save">保存流水线</button>
+        <button class="btn secondary" id="btn-cancel">取消</button>
+      </div>
+    </section>
+
+    <!-- 静态规则弹层 -->
+    <section class="card" id="rules-card" style="display:none">
+      <div class="row spread">
+        <h2 style="margin:0">静态检查规则</h2>
+        <div class="row">
+          <button class="btn small" id="btn-new-rule" type="button">新建规则</button>
+          <button class="btn small secondary" id="btn-close-rules" type="button">关闭</button>
+        </div>
+      </div>
+      <div id="rule-editor" class="mt" style="display:none">
+        <div class="stage-edit">
+          <div class="se-grid">
+            <div><label>规则名称</label><input type="text" id="r-name"></div>
+            <div><label>类型</label><select id="r-type"></select></div>
+            <div><label>级别</label><select id="r-level">
+              <option value="error">error（失败阻断）</option>
+              <option value="warning">warning（仅提示）</option>
+            </select></div>
+            <div><label id="r-param-label">参数</label><input type="text" id="r-param"></div>
+            <div class="row">
+              <button class="btn small" id="btn-save-rule" type="button">保存</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="mt" id="rule-list"><div class="empty">加载中…</div></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("pipelines");
+
+let projectId = null;
+let pipelines = [];
+let suites = [];
+let envs = [];
+let editingId = null;
+let selectedEnvIds = [];
+let stageRows = [];
+let latestTimers = {};
+
+async function init() {
+  const params = new URLSearchParams(location.search);
+  projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
+  await loadRefs();
+  await loadPipelines();
+}
+
+async function switchProject(id) {
+  projectId = id;
+  $("#edit-card").style.display = "none";
+  $("#rules-card").style.display = "none";
+  await loadRefs();
+  await loadPipelines();
+}
+
+async function loadRefs() {
+  if (!projectId) return;
+  const [sd, ed] = await Promise.all([
+    api(`/api/projects/${projectId}/suites`),
+    api(`/api/projects/${projectId}/environments`),
+  ]);
+  suites = sd.suites || [];
+  envs = ed.environments || [];
+}
+
+async function loadPipelines() {
+  if (!projectId) return;
+  const d = await api(`/api/projects/${projectId}/pipelines`);
+  pipelines = d.pipelines || [];
+  const host = $("#pipeline-list");
+  if (!pipelines.length) {
+    host.innerHTML = '<div class="empty">还没有流水线，点击「新建流水线」创建四阶段标准回归。</div>';
+    $("#latest-card").style.display = "none";
+    return;
+  }
+  host.innerHTML = pipelines.map(p => `
+    <div class="pipe-item">
+      <div class="row spread">
+        <div class="row">
+          <strong>${esc(p.name)}</strong>
+          <span class="badge ${p.enabled ? 'blue' : 'pending'}">${p.enabled ? '已启用' : '已停用'}</span>
+          <span class="muted" style="font-size:13px">${p.stage_count} 个阶段</span>
+        </div>
+        <div class="row">
+          <button class="btn small green" onclick="runPipeline('${p.id}', event)">▶ 运行流水线</button>
+          <button class="btn small secondary" onclick="showLatest('${p.id}')">最近运行</button>
+          <button class="btn small secondary" onclick="editPipeline('${p.id}')">编辑</button>
+          <button class="btn small danger" onclick="delPipeline('${p.id}')">删除</button>
+        </div>
+      </div>
+      <div class="bind-line">${esc(p.description || "")}</div>
+      <div class="env-flow">
+        <span class="muted" style="font-size:12px">环境顺序：</span>
+        ${(p.env_names || []).length
+          ? p.env_names.map((n, i) => `<span class="tag">${esc(n)}</span>${
+              i < p.env_names.length - 1 ? '<span class="arrow">→</span>' : ""}`).join("")
+          : '<span class="muted" style="font-size:12px">使用项目默认环境</span>'}
+      </div>
+      <div class="stage-rail mt">
+        ${(p.stages || []).map((s, i) => `
+          <div class="stage-node s-pending" id="rail-${p.id}-${s.id}">
+            <div class="node-dot">${i + 1}</div>
+            <div class="node-label">${esc(s.name)}</div>
+            <div class="node-sub">${STAGE_TYPE_LABELS[s.type] || s.type}</div>
+            <div class="node-sub"><span class="policy-tag ${s.type==='report'?'once':s.on_fail}">${
+              s.type==='report' ? '收尾必跑' : FAIL_POLICY_LABELS[s.on_fail]}</span></div>
+          </div>`).join("")}
+      </div>
+    </div>`).join("");
+  // 自动展示第一条流水线的最近运行
+  showLatest(pipelines[0].id);
+}
+
+/* ---------------- 最近运行阶段轨道（轮询） ---------------- */
+async function showLatest(pipelineId) {
+  const p = pipelines.find(x => x.id === pipelineId);
+  if (!p) return;
+  $("#latest-card").style.display = "block";
+  $("#latest-title").textContent = `最近运行 · ${p.name}`;
+  const builds = (await api(`/api/builds?project_id=${projectId}`)).builds || [];
+  const last = builds.find(b => b.kind === "pipeline" && b.pipeline_id === pipelineId);
+  if (!last) {
+    $("#latest-rail").innerHTML = '<div class="empty" style="padding:14px 0">还没有运行记录，点击「运行流水线」。</div>';
+    $("#latest-link").style.display = "none";
+    return;
+  }
+  $("#latest-link").style.display = "";
+  $("#latest-link").href = `/page/monitor.html?project_id=${projectId}&build_id=${last.id}`;
+  Object.values(latestTimers).forEach(clearInterval);
+  latestTimers = {};
+  pollLatest(last.id, pipelineId);
+  if (last.status === "running" || last.status === "pending") {
+    latestTimers[pipelineId] = setInterval(() => pollLatest(last.id, pipelineId), 1500);
+  }
+}
+
+async function pollLatest(buildId, pipelineId) {
+  const d = await api(`/api/builds/${buildId}/stages`);
+  const p = pipelines.find(x => x.id === pipelineId);
+  const stageMap = Object.fromEntries((d.stages || []).map(s => [s.stage_id, s]));
+  $("#latest-rail").innerHTML = `
+    <div class="stage-rail">
+      ${(p.stages || []).map((s, i) => {
+        const st = stageMap[s.id] || { status: "pending" };
+        const envsText = (st.attempts || []).map(a =>
+          `${esc(a.env_name || '汇总')}:${STATUS_LABELS[a.status] || a.status}`).join(" · ");
+        return `<div class="stage-node s-${st.status}">
+          <div class="node-dot">${i + 1}</div>
+          <div class="node-label">${esc(s.name)}</div>
+          <div class="node-sub">${envsText || STAGE_TYPE_LABELS[s.type]}</div>
+          <div class="node-dur">${st.duration ? fmtDur(st.duration) : ""}</div>
+        </div>`;
+      }).join("")}
+    </div>
+    <div class="row mt" style="font-size:13px" id="rail-meta"><span class="muted">加载构建状态…</span></div>`;
+  const build = await api(`/api/builds/${buildId}`);
+  const meta = $("#rail-meta");
+  if (meta) meta.innerHTML = `${statusBadge(build.status)}
+    <span class="muted">总耗时 ${fmtDur(build.duration)} · 通过 ${build.passed||0}/${build.total||0} ·
+    父构建 <span class="mono">${buildId.slice(0, 20)}…</span></span>`;
+  if (build.status !== "running" && build.status !== "pending") {
+    if (latestTimers[pipelineId]) { clearInterval(latestTimers[pipelineId]); delete latestTimers[pipelineId]; }
+  }
+}
+
+/* ---------------- 运行 ---------------- */
+async function runPipeline(id, ev) {
+  if (ev) ev.stopPropagation();
+  const btn = event.target;
+  setLoading(btn, true, "提交中…");
+  try {
+    const r = await api(`/api/pipelines/${id}/run`, { method: "POST", body: { trigger: "manual" } });
+    toast(`流水线已启动 ${r.id.slice(0, 16)}…`);
+    setTimeout(() => showLatest(id), 400);
+  } catch (e) { toast(e.message, "error"); }
+  setLoading(btn, false);
+}
+
+/* ---------------- 编辑器 ---------------- */
+function newPipeline() {
+  editingId = null;
+  $("#edit-title").textContent = "新建流水线";
+  $("#p-name").value = "标准回归流水线";
+  $("#p-desc").value = "静态检查 → 单元测试 → 接口回归 → 报告";
+  selectedEnvIds = envs.map(e => e.id);
+  stageRows = [];
+  addStageRow({ name: "静态检查", type: "static", on_fail: "continue", env_scope: "pipeline" });
+  addStageRow({ name: "单元测试", type: "unit", on_fail: "continue", env_scope: "pipeline" });
+  addStageRow({ name: "接口回归", type: "api", on_fail: "abort", env_scope: "pipeline" });
+  addStageRow({ name: "生成报告", type: "report", on_fail: "continue", env_scope: "once" });
+  renderEnvOrder();
+  renderStageRows();
+  $("#edit-card").style.display = "block";
+  $("#edit-card").scrollIntoView({ behavior: "smooth" });
+}
+
+function editPipeline(id) {
+  const p = pipelines.find(x => x.id === id);
+  if (!p) return;
+  editingId = id;
+  $("#edit-title").textContent = "编辑流水线";
+  $("#p-name").value = p.name || "";
+  $("#p-desc").value = p.description || "";
+  selectedEnvIds = envs.map(e => e.id).filter(eid => (p.env_ids || []).includes(eid));
+  if (!selectedEnvIds.length && !p.env_ids?.length) selectedEnvIds = envs.map(e => e.id);
+  stageRows = (p.stages || []).map(s => ({ ...s }));
+  renderEnvOrder();
+  renderStageRows();
+  $("#edit-card").style.display = "block";
+  $("#edit-card").scrollIntoView({ behavior: "smooth" });
+}
+
+function renderEnvOrder() {
+  const host = $("#env-order");
+  if (!envs.length) { host.innerHTML = '<div class="muted" style="font-size:13px">项目还没有环境</div>'; return; }
+  host.innerHTML = envs.map((e, i) => {
+    const idx = selectedEnvIds.indexOf(e.id);
+    const checked = idx >= 0;
+    return `<div class="env-chip">
+      <label style="margin:0;font-weight:400;color:var(--text)">
+        <input type="checkbox" style="width:auto;margin-right:6px" ${checked ? "checked" : ""}
+          onchange="toggleEnv('${e.id}')">${esc(e.name)}</label>
+      <span style="flex:1"></span>
+      ${checked ? `<span class="muted mono" style="font-size:12px">第 ${idx + 1} 步</span>
+        <button type="button" class="btn small secondary" style="padding:2px 8px"
+          onclick="moveEnv('${e.id}', -1)" ${idx === 0 ? "disabled" : ""}>↑</button>
+        <button type="button" class="btn small secondary" style="padding:2px 8px"
+          onclick="moveEnv('${e.id}', 1)" ${idx === selectedEnvIds.length - 1 ? "disabled" : ""}>↓</button>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function toggleEnv(eid) {
+  const i = selectedEnvIds.indexOf(eid);
+  if (i >= 0) selectedEnvIds.splice(i, 1);
+  else selectedEnvIds.push(eid);
+  renderEnvOrder();
+}
+
+function moveEnv(eid, delta) {
+  const i = selectedEnvIds.indexOf(eid);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= selectedEnvIds.length) return;
+  [selectedEnvIds[i], selectedEnvIds[j]] = [selectedEnvIds[j], selectedEnvIds[i]];
+  renderEnvOrder();
+}
+
+function addStageRow(st) {
+  stageRows.push({
+    id: st && st.id ? st.id : null,
+    name: st?.name || "新阶段",
+    type: st?.type || "api",
+    on_fail: st?.on_fail || "abort",
+    env_scope: st?.env_scope || "pipeline",
+    suite_id: st?.suite_id || null,
+    tags_any: st?.tags_any || [],
+    env_id: st?.env_id || null,
+  });
+  renderStageRows();
+}
+
+function removeStage(i) {
+  if (stageRows[i]?.type === "report" && !confirm("删除报告阶段后，流水线结束将不再自动生成报告，确认？")) return;
+  stageRows.splice(i, 1);
+  renderStageRows();
+}
+
+function moveStage(i, delta) {
+  const j = i + delta;
+  if (j < 0 || j >= stageRows.length) return;
+  [stageRows[i], stageRows[j]] = [stageRows[j], stageRows[i]];
+  renderStageRows();
+}
+
+function renderStageRows() {
+  $("#stage-list").innerHTML = stageRows.map((s, i) => {
+    const isReport = s.type === "report";
+    return `<div class="stage-edit">
+      <div class="se-grid">
+        <div><label>阶段 ${i + 1} 名称</label>
+          <input type="text" value="${esc(s.name)}" onchange="updStage(${i},'name',this.value)"></div>
+        <div><label>类型</label>
+          <select onchange="updStage(${i},'type',this.value)">
+            ${Object.entries(STAGE_TYPE_LABELS).map(([v, n]) =>
+              `<option value="${v}" ${s.type===v?"selected":""}>${n}</option>`).join("")}
+          </select></div>
+        <div><label>失败策略</label>
+          <select ${isReport ? "disabled" : ""} onchange="updStage(${i},'on_fail',this.value)">
+            <option value="abort" ${s.on_fail==="abort"?"selected":""}>直接中止</option>
+            <option value="continue" ${s.on_fail==="continue"?"selected":""}>继续并标记</option>
+          </select></div>
+        <div><label>环境编排</label>
+          <select ${isReport ? "disabled" : ""} onchange="updStage(${i},'env_scope',this.value)">
+            <option value="pipeline" ${s.env_scope==="pipeline"?"selected":""}>按流水线环境顺序</option>
+            <option value="fixed" ${s.env_scope==="fixed"?"selected":""}>固定一个环境</option>
+            <option value="once" ${s.env_scope==="once"||isReport?"selected":""}>不依赖环境（仅一次）</option>
+          </select></div>
+        <div class="row" style="padding-bottom:6px">
+          <button type="button" class="btn small secondary" style="padding:5px 9px" onclick="moveStage(${i},-1)" ${i===0?"disabled":""}>↑</button>
+          <button type="button" class="btn small secondary" style="padding:5px 9px" onclick="moveStage(${i},1)" ${i===stageRows.length-1?"disabled":""}>↓</button>
+          <button type="button" class="btn small danger" style="padding:5px 9px" onclick="removeStage(${i})">删</button>
+        </div>
+      </div>
+      <div class="se-grid mt" style="grid-template-columns:1fr 1fr">
+        <div><label>绑定套件（用例集合）${isReport ? "· 报告阶段无需绑定" : ""}</label>
+          <select ${isReport || s.type==="static" ? "" : ""} onchange="updStage(${i},'suite_id',this.value)">
+            <option value="">— 全部用例（或按标签） —</option>
+            ${suites.map(su => `<option value="${su.id}" ${s.suite_id===su.id?"selected":""}>${esc(su.name)}（${su.case_count}）</option>`).join("")}
+          </select></div>
+        <div style="${s.env_scope==='fixed' && !isReport ? '' : 'display:none'}" id="fixed-env-${i}">
+          <label>固定环境</label>
+          <select onchange="updStage(${i},'env_id',this.value)">
+            <option value="">— 选择环境 —</option>
+            ${envs.map(e => `<option value="${e.id}" ${s.env_id===e.id?"selected":""}>${esc(e.name)}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+  stageRows.forEach((s, i) => {
+    const host = document.getElementById(`fixed-env-${i}`);
+    if (host) host.style.display = (s.env_scope === "fixed" && s.type !== "report") ? "" : "none";
+  });
+}
+
+function updStage(i, key, val) {
+  stageRows[i][key] = val || null;
+  if (key === "type") {
+    if (val === "report") { stageRows[i].env_scope = "once"; stageRows[i].suite_id = null; stageRows[i].env_id = null; }
+    else if (stageRows[i].env_scope === "once") stageRows[i].env_scope = "pipeline";
+  }
+  renderStageRows();
+}
+
+async function delPipeline(id) {
+  if (!confirm("确认删除该流水线？历史构建记录不会被删除。")) return;
+  await api(`/api/pipelines/${id}`, { method: "DELETE" });
+  toast("已删除");
+  loadPipelines();
+}
+
+$("#btn-new").onclick = newPipeline;
+$("#btn-cancel").onclick = () => { $("#edit-card").style.display = "none"; };
+
+$("#btn-save").onclick = async () => {
+  const name = $("#p-name").value.trim();
+  if (!name) return toast("请输入流水线名称", "error");
+  if (!stageRows.length) return toast("至少配置一个阶段", "error");
+  for (const s of stageRows) {
+    if (s.env_scope === "fixed" && !s.env_id)
+      return toast(`阶段「${s.name}」需要选择固定环境`, "error");
+  }
+  const body = {
+    name, description: $("#p-desc").value,
+    env_ids: selectedEnvIds, enabled: true,
+    stages: stageRows.map(s => ({
+      id: s.id, name: s.name, type: s.type, on_fail: s.on_fail,
+      env_scope: s.env_scope, suite_id: s.suite_id,
+      tags_any: s.tags_any || [], env_id: s.env_id,
+    })),
+  };
+  try {
+    if (editingId) {
+      await api(`/api/pipelines/${editingId}`, { method: "PUT", body });
+      toast("已保存");
+    } else {
+      await api(`/api/projects/${projectId}/pipelines`, { method: "POST", body });
+      toast("流水线已创建，可点击「运行流水线」");
+    }
+  } catch (e) { return toast(e.message, "error"); }
+  $("#edit-card").style.display = "none";
+  loadPipelines();
+};
+
+/* ---------------- 静态规则管理 ---------------- */
+const RULE_TYPE_LABELS = {
+  name_not_empty: "命名非空", steps_not_empty: "步骤非空",
+  must_have_assert: "必须含断言", naming_convention: "命名规范（正则）",
+  no_hardcoded_url: "禁止硬编码 URL", max_steps: "步骤数上限",
+};
+
+$("#btn-rules").onclick = async () => {
+  $("#rules-card").style.display = "block";
+  $("#rule-editor").style.display = "none";
+  $("#r-type").innerHTML = Object.entries(RULE_TYPE_LABELS)
+    .map(([v, n]) => `<option value="${v}">${n}</option>`).join("");
+  await loadRules();
+  $("#rules-card").scrollIntoView({ behavior: "smooth" });
+};
+$("#btn-close-rules").onclick = () => { $("#rules-card").style.display = "none"; };
+
+$("#r-type").onchange = syncRuleParam;
+function syncRuleParam() {
+  const t = $("#r-type").value;
+  const label = $("#r-param-label");
+  const input = $("#r-param");
+  if (t === "naming_convention") { label.textContent = "正则 pattern"; input.value = "^[一-龥A-Za-z0-9（）()\\-_ ·/]+$"; }
+  else if (t === "max_steps") { label.textContent = "最大步骤数"; input.value = "20"; }
+  else { label.textContent = "参数（无需填写）"; input.value = ""; }
+}
+
+$("#btn-new-rule").onclick = () => {
+  $("#r-name").value = ""; $("#r-level").value = "error"; $("#r-type").value = "name_not_empty";
+  syncRuleParam();
+  $("#rule-editor").style.display = "block";
+};
+
+$("#btn-save-rule").onclick = async () => {
+  const name = $("#r-name").value.trim();
+  if (!name) return toast("请输入规则名称", "error");
+  const t = $("#r-type").value;
+  const body = { name, type: t, level: $("#r-level").value };
+  if (t === "naming_convention") body.pattern = $("#r-param").value;
+  if (t === "max_steps") body.max_steps = Number($("#r-param").value) || 20;
+  await api(`/api/projects/${projectId}/static-rules`, { method: "POST", body });
+  toast("规则已保存");
+  $("#rule-editor").style.display = "none";
+  loadRules();
+};
+
+async function loadRules() {
+  const d = await api(`/api/projects/${projectId}/static-rules`);
+  const rules = d.rules || [];
+  $("#rule-list").innerHTML = rules.length ? `<table><thead><tr>
+      <th>名称</th><th>类型</th><th>级别</th><th>参数</th><th>状态</th><th></th></tr></thead><tbody>
+    ${rules.map(r => `<tr>
+      <td>${esc(r.name)}${r.builtin ? ' <span class="tag">内置</span>' : ""}</td>
+      <td>${esc(RULE_TYPE_LABELS[r.type] || r.type)}</td>
+      <td><span class="badge ${r.level==='error'?'failed':'timeout'}">${r.level}</span></td>
+      <td class="mono" style="font-size:12px">${esc(r.pattern || (r.max_steps ? "max="+r.max_steps : ""))}</td>
+      <td><label style="margin:0;font-weight:400"><input type="checkbox" style="width:auto"
+        ${r.enabled?"checked":""} onchange="toggleRule('${r.id}', this.checked)"></label></td>
+      <td>${r.builtin ? "" : `<button class="btn small danger" onclick="delRule('${r.id}')">删除</button>`}</td>
+    </tr>`).join("")}
+  </tbody></table>` : '<div class="empty">暂无规则</div>';
+}
+
+async function toggleRule(id, enabled) {
+  await api(`/api/static-rules/${id}`, { method: "PUT", body: { enabled } });
+  toast(enabled ? "已启用" : "已停用");
+}
+
+async function delRule(id) {
+  await api(`/api/static-rules/${id}`, { method: "DELETE" });
+  toast("已删除");
+  loadRules();
+}
+
+init();
+</script>
+</body>
+</html>

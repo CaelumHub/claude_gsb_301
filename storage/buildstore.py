@@ -50,6 +50,20 @@ RESULT_SHARD_SIZE = 500
 
 _STATUSES = ("pending", "running", "passed", "failed", "cancelled", "error")
 
+# 状态严重度排序：多环境尝试 / 阶段汇总时取最差状态。
+# pending 最轻，running 表示还在推进，skipped/passed 不算失败，
+# cancelled 视为失败之外的中止，failed/error/timeout 最重。
+_STATUS_RANK = {
+    "passed": 0, "skipped": 0, "pending": 1, "running": 2,
+    "cancelled": 3, "timeout": 4, "failed": 5, "error": 6,
+}
+
+
+def _worst_status(statuses) -> str:
+    if not statuses:
+        return "pending"
+    return max(statuses, key=lambda s: _STATUS_RANK.get(s, 6))
+
 
 def _empty_build(build_id: str, project_id: str, **kw: Any) -> dict:
     build = {
@@ -72,6 +86,18 @@ def _empty_build(build_id: str, project_id: str, **kw: Any) -> dict:
         "by_group": {},
         "by_priority": {},
         "durations": [],
+        # -- 阶段化流水线 -------------------------------------------------
+        # kind=build 为普通套件构建（历史行为不变）；
+        # kind=pipeline 为流水线父构建，kind=stage 为父构建下的阶段子构建。
+        "kind": kw.get("kind", "build"),
+        "pipeline_id": kw.get("pipeline_id"),
+        "pipeline_run_id": kw.get("pipeline_run_id"),
+        "parent_build_id": kw.get("parent_build_id"),
+        "stage_id": kw.get("stage_id"),
+        "stage_attempt_id": kw.get("stage_attempt_id"),
+        "env_name": kw.get("env_name"),
+        # 流水线父构建：阶段定义快照 + 每个阶段（含多环境尝试）的运行态
+        "stages": kw.get("stages", []),
         "created_at": time.time(),
     }
     return build
@@ -147,6 +173,24 @@ class BuildStore:
         return self.update(build_id, {"total": total, "status": "running",
                                       "started_at": time.time()})
 
+    def mark_running(self, build_id: str) -> dict:
+        """把构建置为运行中并记录开始时间（不改动总数）。"""
+        with FileLock(self._lock(build_id)):
+            build = read_json(self._build_path(build_id), _empty_build(build_id, self.project_id))
+            if build.get("status") == "pending":
+                build["status"] = "running"
+                build["started_at"] = time.time()
+            atomic_write_json(self._build_path(build_id), build)
+            return build
+
+    def add_total(self, build_id: str, count: int) -> dict:
+        """累加构建的用例总数（流水线分阶段动态扩容时使用）。"""
+        with FileLock(self._lock(build_id)):
+            build = read_json(self._build_path(build_id), _empty_build(build_id, self.project_id))
+            build["total"] = build.get("total", 0) + max(0, int(count))
+            atomic_write_json(self._build_path(build_id), build)
+            return build
+
     def finish(self, build_id: str, status: str) -> dict:
         """结束构建：写入终态、结束时间与总耗时。"""
         with FileLock(self._lock(build_id)):
@@ -157,6 +201,79 @@ class BuildStore:
                 build["duration"] = round(build["finished_at"] - build["started_at"], 3)
             atomic_write_json(self._build_path(build_id), build)
             return build
+
+    # -- 流水线阶段状态 ---------------------------------------------------
+    def get_stage_state(self, build_id: str, stage_id: str) -> Optional[dict]:
+        build = self.get(build_id)
+        if build is None:
+            return None
+        for st in build.get("stages", []):
+            if st.get("stage_id") == stage_id:
+                return st
+        return None
+
+    def put_stage_state(self, build_id: str, stage: dict) -> dict:
+        """插入/整体替换一个阶段的运行态，返回更新后的构建。"""
+        with FileLock(self._lock(build_id)):
+            build = read_json(self._build_path(build_id), _empty_build(build_id, self.project_id))
+            stages = build.setdefault("stages", [])
+            for i, st in enumerate(stages):
+                if st.get("stage_id") == stage.get("stage_id"):
+                    stages[i] = stage
+                    break
+            else:
+                stages.append(stage)
+            atomic_write_json(self._build_path(build_id), build)
+            return build
+
+    def patch_stage_state(self, build_id: str, stage_id: str, patch: dict) -> Optional[dict]:
+        """合并更新一个阶段的顶层字段。"""
+        with FileLock(self._lock(build_id)):
+            build = read_json(self._build_path(build_id), _empty_build(build_id, self.project_id))
+            for st in build.get("stages", []):
+                if st.get("stage_id") == stage_id:
+                    st.update(patch)
+                    atomic_write_json(self._build_path(build_id), build)
+                    return st
+            return None
+
+    def upsert_stage_attempt(self, build_id: str, stage_id: str,
+                             attempt: dict) -> Optional[dict]:
+        """插入或更新某阶段下的一次环境尝试（按 attempt_id 去重）。
+
+        阶段可在多个环境上依次执行（开发先跑、预发后跑），每次尝试记录
+        各自的状态、环境、耗时与所属子构建 id；阶段顶层状态取所有尝试的
+        最差结果。
+        """
+        with FileLock(self._lock(build_id)):
+            build = read_json(self._build_path(build_id), _empty_build(build_id, self.project_id))
+            target = None
+            for st in build.get("stages", []):
+                if st.get("stage_id") == stage_id:
+                    target = st
+                    break
+            if target is None:
+                return None
+            attempts = target.setdefault("attempts", [])
+            for i, at in enumerate(attempts):
+                if at.get("attempt_id") == attempt.get("attempt_id"):
+                    attempts[i] = {**at, **attempt}
+                    break
+            else:
+                attempts.append(attempt)
+            target["attempts"] = attempts
+            target["status"] = _worst_status([a.get("status", "pending") for a in attempts])
+            counts = {"total": 0, "passed": 0, "failed": 0, "error": 0,
+                      "timeout": 0, "skipped": 0}
+            duration = 0.0
+            for a in attempts:
+                for k in counts:
+                    counts[k] += a.get(k, 0)
+                duration += a.get("duration", 0.0) or 0.0
+            target.update(counts)
+            target["duration"] = round(duration, 3)
+            atomic_write_json(self._build_path(build_id), build)
+            return target
 
     def list_builds(self) -> list[dict]:
         """列出本项目所有构建，按创建时间倒序。"""
@@ -170,6 +287,21 @@ class BuildStore:
         builds = [b for b in builds if b]
         builds.sort(key=lambda b: b.get("created_at", 0), reverse=True)
         return builds
+
+    def list_children(self, parent_build_id: str) -> list[dict]:
+        """列出某场流水线父构建下的阶段子构建，按创建时间正序。"""
+        if not os.path.isdir(self.dir):
+            return []
+        children = []
+        for bid in os.listdir(self.dir):
+            bpath = self._build_path(bid)
+            if not os.path.isfile(bpath):
+                continue
+            b = read_json(bpath, None)
+            if b and b.get("parent_build_id") == parent_build_id:
+                children.append(b)
+        children.sort(key=lambda b: b.get("created_at", 0))
+        return children
 
     def delete(self, build_id: str) -> bool:
         import shutil

@@ -44,8 +44,15 @@
             <span class="mono">*/15 * * * *</span> 每 15 分钟 · <span class="mono">0 9 * * 1</span> 每周一 9 点</div>
         </div>
         <div class="grid cols-2 mt">
-          <div><label>目标套件</label><select id="s-suite"></select></div>
-          <div><label>执行环境</label><select id="s-env"><option value="">— 默认 —</option></select></div>
+          <div><label>触发目标类型</label><select id="s-target-type" onchange="onTargetType()">
+            <option value="pipeline">阶段流水线</option>
+            <option value="suite">测试套件</option>
+          </select></div>
+          <div id="wrap-pipeline"><label>目标流水线</label><select id="s-pipeline"></select></div>
+          <div id="wrap-suite" style="display:none"><label>目标套件</label><select id="s-suite"></select></div>
+        </div>
+        <div class="grid cols-2 mt">
+          <div id="wrap-env"><label>执行环境（套件目标，默认套件环境）</label><select id="s-env"><option value="">— 默认 —</option></select></div>
         </div>
         <div class="mt">
           <label style="display:inline-flex;gap:6px;font-weight:400;color:var(--text);align-items:center">
@@ -68,6 +75,7 @@ renderNav("schedules");
 let projectId = null;
 let schedules = [];
 let editingId = null;
+let pipelines = [];
 
 async function init() {
   const params = new URLSearchParams(location.search);
@@ -77,13 +85,24 @@ async function init() {
 
 async function switchProject(id) { projectId = id; editingId = null; await Promise.all([loadSchedules(), loadRefs()]); }
 
+function onTargetType() {
+  const isPipe = $("#s-target-type").value === "pipeline";
+  $("#wrap-pipeline").style.display = isPipe ? "" : "none";
+  $("#wrap-suite").style.display = isPipe ? "none" : "";
+  $("#wrap-env").style.display = isPipe ? "none" : "";
+}
+
 async function loadRefs() {
-  const [suites, envs] = await Promise.all([
+  const [suites, envs, pipes] = await Promise.all([
     api(`/api/projects/${projectId}/suites`),
     api(`/api/projects/${projectId}/environments`),
+    api(`/api/projects/${projectId}/pipelines`),
   ]);
+  pipelines = pipes.pipelines || [];
   $("#s-suite").innerHTML = '<option value="">— 选择套件 —</option>' +
     (suites.suites||[]).map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join("");
+  $("#s-pipeline").innerHTML = '<option value="">— 选择流水线 —</option>' +
+    pipelines.map(p => `<option value="${p.id}">${esc(p.name)}（${p.stage_count} 阶段）</option>`).join("");
   $("#s-env").innerHTML = '<option value="">— 默认 —</option>' +
     (envs.environments||[]).map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join("");
 }
@@ -93,10 +112,16 @@ async function loadSchedules() {
   schedules = d.schedules || [];
   const host = $("#sch-list");
   if (!schedules.length) { host.innerHTML = '<div class="empty">暂无定时任务</div>'; return; }
-  host.innerHTML = schedules.map(s => `
+  host.innerHTML = schedules.map(s => {
+    const pipe = pipelines.find(p => p.id === s.pipeline_id);
+    const target = s.pipeline_id
+      ? `流水线：${pipe ? esc(pipe.name) : esc(s.pipeline_id)}`
+      : `套件：${esc(s.suite_id || "—")}`;
+    return `
     <div class="sch-item">
       <div class="row spread">
         <div class="row"><strong>${esc(s.name)}</strong>
+          ${s.pipeline_id ? '<span class="kind-tag" style="font-size:11px;padding:1px 8px;border-radius:999px;background:#f3e8ff;color:var(--violet)">流水线</span>' : ""}
           <span class="badge ${s.enabled?'blue':'pending'}">${s.enabled?'已启用':'已停用'}</span></div>
         <div class="row">
           <button class="btn small secondary" onclick="toggle('${s.id}', ${!s.enabled})">${s.enabled?'停用':'启用'}</button>
@@ -105,17 +130,21 @@ async function loadSchedules() {
         </div>
       </div>
       <div class="cron-box mt">${esc(s.cron)}</div>
-      <div class="mt muted" style="font-size:13px">${esc(s.description||"")}</div>
+      <div class="mt muted" style="font-size:13px">${esc(s.description||"")} · 目标 ${target}</div>
       <div class="mt" style="font-size:12px;color:var(--text-muted)">上次触发: ${s.last_fired_minute?esc(s.last_fired_minute):"—"} ·
         最近执行: ${(s.recent_runs||[]).length} 次</div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 
 function newSch() {
   editingId = null;
   $("#edit-title").textContent = "新建定时任务";
   $("#s-name").value = ""; $("#s-cron").value = "*/10 * * * *"; $("#s-enabled").checked = true;
+  $("#s-target-type").value = "pipeline";
+  $("#s-pipeline").value = pipelines[0] ? pipelines[0].id : "";
   $("#s-suite").value = ""; $("#s-env").value = "";
+  onTargetType();
   previewCron();
 }
 
@@ -125,7 +154,15 @@ function editSch(id) {
   editingId = id;
   $("#edit-title").textContent = "编辑定时任务";
   $("#s-name").value = s.name || ""; $("#s-cron").value = s.cron || ""; $("#s-enabled").checked = s.enabled !== false;
-  $("#s-suite").value = s.suite_id || ""; $("#s-env").value = s.env_id || "";
+  if (s.pipeline_id) {
+    $("#s-target-type").value = "pipeline";
+    $("#s-pipeline").value = s.pipeline_id || "";
+  } else {
+    $("#s-target-type").value = "suite";
+    $("#s-suite").value = s.suite_id || "";
+    $("#s-env").value = s.env_id || "";
+  }
+  onTargetType();
   previewCron();
 }
 
@@ -157,10 +194,15 @@ $("#btn-cancel").onclick = () => { editingId = null; };
 $("#btn-save").onclick = async () => {
   const cron = $("#s-cron").value.trim();
   if (!cron) return toast("请输入 cron 表达式", "error");
-  const suiteId = $("#s-suite").value;
-  if (!suiteId) return toast("请选择目标套件", "error");
-  const body = { name: $("#s-name").value || "定时任务", cron, suite_id: suiteId,
-    env_id: $("#s-env").value || null, enabled: $("#s-enabled").checked };
+  const isPipe = $("#s-target-type").value === "pipeline";
+  const pipelineId = isPipe ? $("#s-pipeline").value : null;
+  const suiteId = isPipe ? null : $("#s-suite").value;
+  if (isPipe && !pipelineId) return toast("请选择目标流水线", "error");
+  if (!isPipe && !suiteId) return toast("请选择目标套件", "error");
+  const body = { name: $("#s-name").value || "定时任务", cron,
+    pipeline_id: pipelineId, suite_id: suiteId,
+    env_id: isPipe ? null : ($("#s-env").value || null),
+    enabled: $("#s-enabled").checked };
   try {
     if (editingId) {
       await api(`/api/schedules/${editingId}`, { method: "PUT", body });

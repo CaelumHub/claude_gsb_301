@@ -15,6 +15,7 @@
     .live .console { flex: 1; min-height: 320px; }
     .meta-line { font-size: 13px; padding: 5px 0; border-bottom: 1px solid var(--border); }
     .result-item { font-size: 13px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .kind-tag { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: #f3e8ff; color: var(--violet); }
   </style>
 </head>
 <body>
@@ -23,14 +24,20 @@
 
   <main class="main">
     <h1 class="page-title">执行监控</h1>
-    <p class="page-desc">实时查看构建状态与日志，支持取消运行中的构建。</p>
+    <p class="page-desc">实时查看构建/流水线的阶段状态、各环境耗时与日志，支持取消运行中的任务。</p>
 
     <div class="card">
       <div class="row">
         <label style="margin:0 6px 0 0;align-self:center">项目</label>
         <select id="project-select" style="max-width:240px" onchange="switchProject(this.value)"></select>
-        <label style="margin:0 6px 0 0 12px">过滤</label>
-        <select id="filter" style="max-width:140px" onchange="loadBuilds()">
+        <label style="margin:0 6px 0 0 12px">类型</label>
+        <select id="kind-filter" style="max-width:130px" onchange="loadBuilds()">
+          <option value="">全部</option>
+          <option value="pipeline">流水线</option>
+          <option value="build">套件构建</option>
+        </select>
+        <label style="margin:0 6px 0 0 12px">状态</label>
+        <select id="filter" style="max-width:120px" onchange="loadBuilds()">
           <option value="">全部</option><option>running</option><option>passed</option><option>failed</option><option>cancelled</option>
         </select>
         <span style="flex:1"></span>
@@ -40,16 +47,21 @@
 
     <div class="grid cols-2">
       <section class="card">
-        <h2>构建列表</h2>
+        <h2>任务列表</h2>
         <div class="build-list" id="build-list"><div class="empty">加载中…</div></div>
       </section>
 
       <section class="card">
         <div class="row spread">
-          <h2 style="margin:0" id="live-title">请选择构建</h2>
-          <button class="btn danger small" id="btn-cancel" style="display:none">取消构建</button>
+          <h2 style="margin:0" id="live-title">请选择任务</h2>
+          <button class="btn danger small" id="btn-cancel" style="display:none">取消</button>
         </div>
         <div id="live-meta"></div>
+        <div class="mt" id="pipeline-panel" style="display:none">
+          <label>流水线阶段（点击环境尝试可查看该阶段子构建结果）</label>
+          <div id="stage-rail-box"></div>
+          <div id="stage-cards" class="mt"></div>
+        </div>
         <div class="mt"><label>实时日志</label>
           <div class="console" id="console">—</div></div>
         <div class="mt"><h3>用例结果</h3><div id="results"></div></div>
@@ -65,6 +77,7 @@ renderNav("monitor");
 let projectId = null;
 let builds = [];
 let currentBuild = null;
+let currentKind = "build";
 let logSeq = 0;
 let pollTimer = null;
 
@@ -72,10 +85,9 @@ async function init() {
   const params = new URLSearchParams(location.search);
   projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
   await loadBuilds();
-  // 自动选中最近一个运行中的构建
-  const running = builds.find(b => b.status === "running");
-  if (running) selectBuild(running.id);
-  else if (builds[0]) selectBuild(builds[0].id);
+  const wantId = params.get("build_id");
+  const target = (wantId && builds.find(b => b.id === wantId)) || builds.find(b => b.status === "running") || builds[0];
+  if (target) selectBuild(target.id);
 }
 
 async function switchProject(id) { projectId = id; currentBuild = null; stopPoll(); await loadBuilds(); }
@@ -83,28 +95,43 @@ async function switchProject(id) { projectId = id; currentBuild = null; stopPoll
 async function loadBuilds() {
   if (!projectId) return;
   const d = await api(`/api/builds?project_id=${projectId}`);
-  builds = d.builds || [];
+  // 列表里隐藏阶段子构建（它们在父流水线详情里展示）
+  builds = (d.builds || []).filter(b => b.kind !== "stage");
   const f = $("#filter").value;
-  const list = f ? builds.filter(b => b.status === f) : builds;
+  const kf = $("#kind-filter").value;
+  const list = builds.filter(b => (!f || b.status === f) && (!kf || (b.kind || "build") === kf));
   const host = $("#build-list");
-  if (!list.length) { host.innerHTML = '<div class="empty">暂无构建，到「套件」页触发一次执行。</div>'; return; }
+  if (!list.length) { host.innerHTML = '<div class="empty">暂无任务，到「套件」或「流水线」页触发一次执行。</div>'; return; }
   host.innerHTML = list.map(b => {
     const total = b.total || 0, done = (b.passed||0)+(b.failed||0)+(b.error||0)+(b.timeout||0)+(b.skipped||0);
     const ratio = total ? done/total : 0;
+    const isPipe = b.kind === "pipeline";
+    const miniRail = isPipe && (b.stages || []).length ? `<div class="stage-rail" style="padding:10px 2px 2px">
+      ${b.stages.map((s, i) => `<div class="stage-node s-${s.status}" style="min-width:0;flex:1">
+        <div class="node-dot" style="width:22px;height:22px;font-size:11px">${i+1}</div>
+        <div class="node-sub" style="margin-top:3px">${fmtDur(s.duration||0)}</div>
+      </div>`).join("")}
+    </div>` : "";
     return `<div class="build-item ${b.id===currentBuild?'active':''}" onclick="selectBuild('${b.id}')">
       <div class="row spread">
-        <div class="row"><strong>${esc(b.name||b.id)}</strong>${statusBadge(b.status)}</div>
+        <div class="row"><strong>${esc(b.name||b.id)}</strong>
+          ${isPipe ? '<span class="kind-tag">流水线</span>' : ""}
+          ${statusBadge(b.status)}</div>
         <span class="muted mono" style="font-size:12px">${fmtTime(b.created_at)}</span>
       </div>
-      <div class="mt" style="font-size:12px;color:var(--text-muted)">通过 ${b.passed||0} / 共 ${total}
-        · 失败 ${(b.failed||0)+(b.error||0)} · 耗时 ${fmtDur(b.duration)}</div>
+      <div class="mt" style="font-size:12px;color:var(--text-muted)">
+        ${isPipe && b.env_name ? `环境顺序 ${esc(b.env_name)} · ` : ""}
+        通过 ${b.passed||0} / 共 ${total} · 失败 ${(b.failed||0)+(b.error||0)} · 耗时 ${fmtDur(b.duration)}</div>
       ${progressBar(ratio, b.status==='passed'?'green':(b.status==='failed'?'red':''))}
+      ${miniRail}
     </div>`;
   }).join("");
 }
 
 function selectBuild(id) {
+  const b = builds.find(x => x.id === id);
   currentBuild = id;
+  currentKind = b ? (b.kind || "build") : "build";
   logSeq = 0;
   $("#console").textContent = "等待日志…";
   $$(".build-item").forEach(el => el.classList.remove("active"));
@@ -120,16 +147,26 @@ async function poll() {
   if (!currentBuild) return;
   try {
     const b = await api(`/api/builds/${currentBuild}`);
+    currentKind = b.kind || "build";
     $("#live-title").textContent = b.name || b.id;
     const total = b.total || 0, done = (b.passed||0)+(b.failed||0)+(b.error||0)+(b.timeout||0)+(b.skipped||0);
     $("#live-meta").innerHTML = `
-      <div class="row mt">${statusBadge(b.status)}
-        <span class="muted" style="font-size:13px">通过 <strong>${b.passed||0}</strong> / 失败 <strong style="color:var(--red)">${(b.failed||0)+(b.error||0)+(b.timeout||0)}</strong> / 共 ${total}</span>
+      <div class="row mt">
+        ${b.kind === "pipeline" ? '<span class="kind-tag">流水线</span>' : ""}
+        ${statusBadge(b.status)}
+        <span class="muted" style="font-size:13px">通过 <strong>${b.passed||0}</strong> / 失败 <strong style="color:var(--red)">${(b.failed||0)+(b.error||0)+(b.timeout||0)}</strong> / 跳过 ${b.skipped||0} / 共 ${total}</span>
         <span class="muted mono" style="font-size:12px">触发: ${esc(b.trigger||'manual')} · ${fmtTime(b.started_at)}</span>
       </div>
       ${progressBar(total ? done/total : 0, b.status==='passed'?'green':(b.status==='failed'||b.status==='error'?'red':''))}`;
     const running = b.status === "running" || b.status === "pending";
     $("#btn-cancel").style.display = running ? "inline-flex" : "none";
+
+    if (b.kind === "pipeline") {
+      $("#pipeline-panel").style.display = "";
+      await renderPipeline(b);
+    } else {
+      $("#pipeline-panel").style.display = "none";
+    }
 
     // 日志增量
     const logs = await api(`/api/builds/${currentBuild}/logs?after=${logSeq}`);
@@ -141,10 +178,68 @@ async function poll() {
     }
     logSeq = logs.next_seq || logSeq;
 
-    // 用例结果
+    // 用例结果（父构建镜像了所有阶段结果，可直接展示）
     const res = await api(`/api/builds/${currentBuild}/results`);
     renderResults(res.results || [], running);
   } catch (e) { /* 构建可能被删除 */ }
+}
+
+async function renderPipeline(b) {
+  const d = await api(`/api/builds/${currentBuild}/stages`);
+  const defs = (await api(`/api/pipelines/${b.pipeline_id}`).catch(() => ({ stages: [] }))).stages || [];
+  const defMap = Object.fromEntries(defs.map(s => [s.id, s]));
+  const stateMap = Object.fromEntries((d.stages || []).map(s => [s.stage_id, s]));
+
+  // 顶部横向轨道
+  $("#stage-rail-box").innerHTML = `<div class="stage-rail">
+    ${defs.map((sd, i) => {
+      const st = stateMap[sd.id] || { status: "pending", attempts: [] };
+      const attText = (st.attempts || []).map(a => esc(a.env_name || "汇总")).join(" → ")
+        || STAGE_TYPE_LABELS[sd.type];
+      return `<div class="stage-node s-${st.status}">
+        <div class="node-dot">${i + 1}</div>
+        <div class="node-label">${esc(sd.name)}</div>
+        <div class="node-sub">${attText}</div>
+        <div class="node-dur">${st.duration ? fmtDur(st.duration) : ""}</div>
+      </div>`;
+    }).join("")}
+  </div>`;
+
+  // 阶段卡片：状态、失败策略、每个环境尝试（可点击跳子构建）
+  $("#stage-cards").innerHTML = defs.map(sd => {
+    const st = stateMap[sd.id] || { status: "pending", attempts: [] };
+    const policy = sd.type === "report"
+      ? '<span class="policy-tag once">收尾必跑</span>'
+      : `<span class="policy-tag ${sd.on_fail}">${FAIL_POLICY_LABELS[sd.on_fail]}</span>`;
+    const scope = sd.env_scope === "once" ? "仅一次"
+      : sd.env_scope === "fixed" ? `固定：${esc(sd.env_name || sd.env_id || "")}`
+      : "按流水线环境顺序";
+    const att = (st.attempts || []).map(a => {
+      const done = (a.passed||0)+(a.failed||0)+(a.error||0)+(a.timeout||0)+(a.skipped||0);
+      const click = a.build_id ? `onclick="selectBuild('${a.build_id}')" title="查看该阶段构建"` : "";
+      return `<div class="attempt-row" ${click}>
+        <span class="att-main">
+          <span class="dot ${a.status==='passed'?'green':(a.status==='running'?'blue':(a.status==='skipped'?'gray':'red'))}"></span>
+          <strong>${esc(a.env_name || "汇总")}</strong>
+          ${badge(a.status)}
+          <span class="muted" style="font-size:12px">${a.passed||0}/${a.total||done}</span>
+        </span>
+        <span class="att-meta">${fmtDur(a.duration)} ${a.build_id ? "· 点击查看 →" : ""}</span>
+      </div>`;
+    }).join("");
+    return `<div class="stage-card ${st.status}">
+      <div class="row spread">
+        <div class="row">
+          <strong>${esc(sd.name)}</strong>
+          <span class="tag">${STAGE_TYPE_LABELS[sd.type] || sd.type}</span>
+          ${policy}
+          <span class="muted" style="font-size:12px">${scope}</span>
+        </div>
+        ${statusBadge(st.status)}
+      </div>
+      ${att}
+    </div>`;
+  }).join("");
 }
 
 function renderResults(results, running) {
@@ -152,14 +247,17 @@ function renderResults(results, running) {
   if (!results.length) { host.innerHTML = '<div class="muted">' + (running ? "执行中，暂无结果…" : "无结果") + '</div>'; return; }
   host.innerHTML = `<div style="max-height:260px;overflow:auto">` + results.map(r => `
     <div class="result-item row spread">
-      <span>${esc(r.case_name||r.case_id)} ${statusBadge(r.status)}</span>
+      <span>${esc(r.case_name||r.case_id)} ${statusBadge(r.status)}
+        ${r.group==='static' ? '<span class="tag">静态</span>' : (r.group==='stage' ? '<span class="tag">阶段</span>' : "")}
+        ${r.env_name ? `<span class="muted" style="font-size:12px">${esc(r.env_name)}</span>` : ""}
+      </span>
       <span class="mono muted" style="font-size:12px">${fmtDur(r.duration)}</span>
     </div>`).join("") + "</div>";
 }
 
 $("#btn-cancel").onclick = async () => {
   if (!currentBuild) return;
-  if (!confirm("确认取消该构建？")) return;
+  if (!confirm("确认取消该任务？正在跑的用例将中止，未开始的阶段标记跳过。")) return;
   await api(`/api/builds/${currentBuild}/cancel`, { method: "POST" });
   toast("已请求取消");
 };

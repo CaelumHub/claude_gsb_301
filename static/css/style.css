@@ -261,6 +261,59 @@ td .mono { font-size: 12px; color: var(--text-muted); }
 
 .empty { text-align: center; color: var(--text-muted); padding: 30px 0; }
 
+/* ---------- 阶段流水线 ---------- */
+.pipe-item { border: 1px solid var(--border); border-radius: 9px; padding: 14px 16px; margin-bottom: 10px; }
+.pipe-item:hover { border-color: var(--primary); }
+
+/* 横向阶段轨道：圆点 + 连线，一眼看出顺序与当前阶段 */
+.stage-rail { display: flex; align-items: flex-start; overflow-x: auto; padding: 8px 2px 14px; }
+.stage-node { display: flex; flex-direction: column; align-items: center; min-width: 120px; flex: 1; position: relative; }
+.stage-node .node-dot {
+  width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: 14px; font-weight: 700;
+  background: #f1f5f9; color: #94a3b8; border: 2px solid #e2e8f0; z-index: 2;
+}
+.stage-node .node-label { margin-top: 8px; font-size: 13px; font-weight: 600; text-align: center; }
+.stage-node .node-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; text-align: center; }
+.stage-node .node-dur { font-size: 11px; color: var(--text-muted); font-family: var(--mono); margin-top: 2px; }
+.stage-node:not(:last-child)::after {
+  content: ""; position: absolute; top: 17px; left: calc(50% + 22px); right: calc(-50% + 22px);
+  height: 2px; background: #e2e8f0; z-index: 1;
+}
+.stage-node.s-passed .node-dot { background: #e7f6ec; color: var(--green); border-color: var(--green); }
+.stage-node.s-passed:not(:last-child)::after { background: var(--green); }
+.stage-node.s-failed .node-dot, .stage-node.s-error .node-dot, .stage-node.s-timeout .node-dot
+  { background: #fdecec; color: var(--red); border-color: var(--red); }
+.stage-node.s-failed:not(:last-child)::after, .stage-node.s-error:not(:last-child)::after
+  { background: var(--red); }
+.stage-node.s-running .node-dot { background: var(--primary-soft); color: var(--primary); border-color: var(--primary); }
+.stage-node.s-running:not(:last-child)::after { background: var(--primary); }
+.stage-node.s-skipped .node-dot { background: #f1f5f9; color: #94a3b8; border-style: dashed; }
+.stage-node.s-cancelled .node-dot { background: #f1f5f9; color: #94a3b8; }
+
+.stage-card { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin-bottom: 10px; background: #fff; }
+.stage-card.running { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.stage-card.failed, .stage-card.error, .stage-card.timeout { border-color: #f3b4b4; background: #fffafa; }
+.stage-card.skipped { opacity: .72; }
+.attempt-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; margin-top: 6px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; font-size: 13px; cursor: pointer; }
+.attempt-row:hover { border-color: var(--primary); }
+.attempt-row .att-main { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.attempt-row .att-meta { font-family: var(--mono); font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+
+/* 流水线编辑器里的阶段行 */
+.stage-edit { border: 1px solid var(--border); border-radius: 9px; padding: 12px; margin-bottom: 10px; background: var(--surface-2); }
+.stage-edit .se-grid { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
+.stage-edit select, .stage-edit input { padding: 7px 10px; font-size: 13px; }
+.env-order { display: flex; flex-direction: column; gap: 6px; }
+.env-order .env-chip { display: flex; align-items: center; gap: 8px; background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; font-size: 13px; }
+.env-order .env-chip .arrow { color: var(--text-muted); font-family: var(--mono); }
+.policy-tag { font-size: 11px; padding: 1px 8px; border-radius: 999px; }
+.policy-tag.abort { background: #fdecec; color: var(--red); }
+.policy-tag.continue { background: #fef3e2; color: var(--amber); }
+.policy-tag.once { background: var(--primary-soft); color: var(--primary); }
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 900px) {
   .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }

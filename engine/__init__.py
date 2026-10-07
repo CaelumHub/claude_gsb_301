@@ -4,6 +4,7 @@
 --------
 - :mod:`engine.models`      领域模型与通用工具（id 生成、优先级、状态枚举）
 - :mod:`engine.executor`    测试用例执行器（步骤 + 断言 + 模拟请求 + 超时）
+- :mod:`engine.staticcheck` 静态检查引擎（规则校验用例定义，流水线首阶段）
 - :mod:`engine.cron`        5 段 cron 表达式匹配（定时触发）
 - :mod:`engine.environments`环境管理（配置、依赖解析、工作区隔离）
 - :mod:`engine.coverage`    代码覆盖率分析（模拟，按构建稳定生成）
@@ -17,11 +18,16 @@ from .models import (
     PRIORITIES,
     CASE_STATUSES,
     BUILD_STATUSES,
+    STAGE_STATUSES,
+    STAGE_TYPES,
+    STAGE_FAIL_POLICIES,
+    STAGE_ENV_SCOPES,
     new_id,
     now,
 )
 from .cron import CronSchedule, cron_matches, parse_cron
 from .executor import TestExecutor, ExecutionError
+from .staticcheck import StaticChecker
 from .environments import EnvironmentManager
 from .coverage import CoverageAnalyzer
 from .report import ReportGenerator
@@ -33,6 +39,10 @@ __all__ = [
     "PRIORITIES",
     "CASE_STATUSES",
     "BUILD_STATUSES",
+    "STAGE_STATUSES",
+    "STAGE_TYPES",
+    "STAGE_FAIL_POLICIES",
+    "STAGE_ENV_SCOPES",
     "new_id",
     "now",
     "CronSchedule",
@@ -40,6 +50,7 @@ __all__ = [
     "parse_cron",
     "TestExecutor",
     "ExecutionError",
+    "StaticChecker",
     "EnvironmentManager",
     "CoverageAnalyzer",
     "ReportGenerator",

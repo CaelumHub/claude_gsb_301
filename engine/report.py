@@ -53,8 +53,10 @@ class ReportGenerator:
             return cached
 
         report = self._compute(store, build_id, build)
-        if build.get("status") not in ("running", "pending"):
-            store.write_report(build_id, report)
+        # 流水线的报告阶段可能在父构建仍处于 running 时提前生成报告，
+        # 因此无论构建是否已结束都写缓存；构建结束后 _finalize 会以
+        # force=True 再算一次并覆盖为最终口径。
+        store.write_report(build_id, report)
         return report
 
     def _compute(self, store, build_id: str, build: dict) -> dict:
@@ -100,9 +102,34 @@ class ReportGenerator:
             "by_priority": build.get("by_priority", {}),
             "slowest": self._slowest(store, build_id, 10),
             "failures": self._failures(store, build_id, 50),
+            "stages": self._stage_summary(build),
             "generated_at": time.time(),
         }
         return report
+
+    @staticmethod
+    def _stage_summary(build: dict) -> list:
+        """流水线报告里的阶段汇总（状态/耗时/各环境尝试）。"""
+        out = []
+        for st in build.get("stages", []):
+            out.append({
+                "stage_id": st.get("stage_id"),
+                "name": st.get("name"),
+                "type": st.get("type"),
+                "status": st.get("status"),
+                "duration": st.get("duration", 0.0),
+                "total": st.get("total", 0),
+                "passed": st.get("passed", 0),
+                "failed": st.get("failed", 0),
+                "attempts": [{
+                    "env_name": a.get("env_name"),
+                    "status": a.get("status"),
+                    "duration": a.get("duration", 0.0),
+                    "passed": a.get("passed", 0),
+                    "total": a.get("total", 0),
+                } for a in st.get("attempts", [])],
+            })
+        return out
 
     def _slowest(self, store, build_id: str, top: int) -> list[dict]:
         records = store.results(build_id, order_by="duration", order="desc",
@@ -135,7 +162,8 @@ class ReportGenerator:
     # -- 项目级趋势 / 汇总 ------------------------------------------------
     def project_report(self, project_id: str, limit: int = 20) -> dict:
         store = self.builds.for_project(project_id)
-        builds = store.list_builds()[:limit]
+        # 阶段子构建（kind=stage）已并入父流水线的报告与聚合，趋势里不重复计
+        builds = [b for b in store.list_builds() if b.get("kind") != "stage"][:limit]
         points = []
         for b in reversed(builds):
             finished = b.get("total", 0) - b.get("skipped", 0)
@@ -144,6 +172,7 @@ class ReportGenerator:
                 "name": b.get("name") or b["id"],
                 "status": b.get("status"),
                 "trigger": b.get("trigger"),
+                "kind": b.get("kind", "build"),
                 "total": b.get("total", 0),
                 "passed": b.get("passed", 0),
                 "failed": b.get("failed", 0) + b.get("error", 0) + b.get("timeout", 0),
