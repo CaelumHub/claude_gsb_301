@@ -125,8 +125,10 @@ class ShardedStore:
         record = dict(record)
         with FileLock(lock_path_for(self.meta_path)):
             meta = self._read_meta()
+            # 调用方可显式指定 id（如固定的业务主键）；未指定才用自增 id
             record_id = record.get("id") or f"{self.name}_{meta['next_id']}"
-            meta["next_id"] += 1
+            if not record.get("id"):
+                meta["next_id"] += 1
             record["id"] = record_id
             record.setdefault("created_at", time.time())
 
@@ -161,7 +163,8 @@ class ShardedStore:
             for record in records:
                 record = dict(record)
                 rid = record.get("id") or f"{self.name}_{meta['next_id']}"
-                meta["next_id"] += 1
+                if not record.get("id"):
+                    meta["next_id"] += 1
                 record["id"] = rid
                 record.setdefault("created_at", time.time())
                 pending.append(record)

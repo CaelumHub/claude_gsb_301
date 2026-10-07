@@ -59,6 +59,11 @@ def _empty_build(build_id: str, project_id: str, **kw: Any) -> dict:
         "env_id": kw.get("env_id"),
         "name": kw.get("name", ""),
         "trigger": kw.get("trigger", "manual"),
+        # kind：suite=普通套件构建，static=静态检查阶段构建；
+        # 流水线下属阶段构建会额外带上 pipeline_run_id / pipeline_stage_id。
+        "kind": kw.get("kind", "suite"),
+        "pipeline_run_id": kw.get("pipeline_run_id"),
+        "pipeline_stage_id": kw.get("pipeline_stage_id"),
         "status": "pending",
         "total": 0,
         "passed": 0,

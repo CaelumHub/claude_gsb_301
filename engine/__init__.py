@@ -17,12 +17,17 @@ from .models import (
     PRIORITIES,
     CASE_STATUSES,
     BUILD_STATUSES,
+    PIPELINE_RUN_STATUSES,
+    STAGE_STATUSES,
+    STAGE_TYPES,
+    STAGE_FAILURE_POLICIES,
     new_id,
     now,
 )
 from .cron import CronSchedule, cron_matches, parse_cron
 from .executor import TestExecutor, ExecutionError
 from .environments import EnvironmentManager
+from .staticcheck import CHECKS, CHECK_MAP, DEFAULT_CHECKS, build_static_cases
 from .coverage import CoverageAnalyzer
 from .report import ReportGenerator
 from .defects import DefectManager
@@ -33,6 +38,10 @@ __all__ = [
     "PRIORITIES",
     "CASE_STATUSES",
     "BUILD_STATUSES",
+    "PIPELINE_RUN_STATUSES",
+    "STAGE_STATUSES",
+    "STAGE_TYPES",
+    "STAGE_FAILURE_POLICIES",
     "new_id",
     "now",
     "CronSchedule",
@@ -41,6 +50,10 @@ __all__ = [
     "TestExecutor",
     "ExecutionError",
     "EnvironmentManager",
+    "CHECKS",
+    "CHECK_MAP",
+    "DEFAULT_CHECKS",
+    "build_static_cases",
     "CoverageAnalyzer",
     "ReportGenerator",
     "DefectManager",

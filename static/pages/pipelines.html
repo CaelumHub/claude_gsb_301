@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>测试流水线 - 自动化测试与持续集成平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .pipe-item { border: 1px solid var(--border); border-radius: 9px; padding: 14px 16px; margin-bottom: 12px; }
+    .stage-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+      background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; margin: 3px 4px 3px 0; }
+    .stage-chip .arrow { color: var(--text-muted); }
+    .stage-chip .env { color: var(--primary); }
+
+    /* 阶段时间轴 */
+    .timeline { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding: 8px 2px 14px; }
+    .tl-node { min-width: 175px; max-width: 210px; flex: 1; position: relative; }
+    .tl-node:not(:last-child)::after {
+      content: ""; position: absolute; top: 19px; right: -11px; width: 22px; height: 2px;
+      background: var(--border); z-index: 0;
+    }
+    .tl-node.gate-passed:not(:last-child)::after { background: var(--green); }
+    .tl-node.gate-failed:not(:last-child)::after { background: var(--red); }
+    .tl-node.gate-warning:not(:last-child)::after { background: var(--amber); }
+    .tl-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-right: 12px;
+      background: var(--surface); height: 100%; transition: border-color .15s, box-shadow .15s; }
+    .tl-card.running { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+    .tl-card.passed { border-color: #bfe5cb; background: #f5fcf7; }
+    .tl-card.failed { border-color: #f3c0c0; background: #fef7f7; }
+    .tl-card.warning { border-color: #f0d29a; background: #fffaef; }
+    .tl-card.skipped, .tl-card.cancelled { opacity: .65; background: var(--surface-2); }
+    .tl-head { display: flex; align-items: center; gap: 7px; }
+    .tl-dot { width: 12px; height: 12px; border-radius: 50%; background: #cbd5e1; flex: none; position: relative; z-index: 1; }
+    .tl-dot.running { background: var(--primary); animation: pulse 1.1s infinite; }
+    .tl-dot.passed { background: var(--green); }
+    .tl-dot.failed { background: var(--red); }
+    .tl-dot.warning { background: var(--amber); }
+    .tl-dot.skipped, .tl-dot.cancelled { background: #94a3b8; }
+    @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(79,110,247,.45);} 70% { box-shadow: 0 0 0 8px rgba(79,110,247,0);} 100% { box-shadow: 0 0 0 0 rgba(79,110,247,0);} }
+    .tl-name { font-weight: 600; font-size: 13.5px; }
+    .tl-meta { font-size: 12px; color: var(--text-muted); margin-top: 7px; line-height: 1.5; }
+    .tl-meta .mono { color: var(--text); }
+    .tl-duration { font-family: var(--mono); font-size: 12px; color: var(--primary); font-weight: 600; }
+    .tl-duration.live { color: var(--amber); }
+    .tl-stage-bar { height: 4px; border-radius: 999px; background: var(--border); margin-top: 8px; overflow: hidden; }
+    .tl-stage-bar i { display: block; height: 100%; background: var(--green); }
+    .tl-stage-bar i.fail { background: var(--red); }
+
+    /* 编辑器里的阶段行 */
+    .stage-row { border: 1px solid var(--border); border-radius: 9px; padding: 12px; margin-bottom: 10px; background: var(--surface-2); }
+    .stage-row .ord { display: inline-flex; width: 24px; height: 24px; border-radius: 50%; background: var(--primary);
+      color: #fff; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; }
+    .check-grid label { display: inline-flex; width: 48%; font-weight: 400; font-size: 13px; align-items: center; gap: 6px; }
+    .check-grid input { width: auto; }
+    .pipeline-log { max-height: 220px; overflow: auto; font-family: var(--mono); font-size: 12px;
+      background: #1f2636; color: #cbd5e1; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">测试流水线</h1>
+    <p class="page-desc">把一次完整验证拆成有顺序的阶段：静态检查 → 单元测试 → 接口回归（dev→staging）→ 报告；前阶段通过才进入下一阶段，失败可中止或继续标记。</p>
+
+    <!-- 列表视图 -->
+    <div id="view-list">
+      <div class="card">
+        <div class="row">
+          <label style="margin:0 6px 0 0;align-self:center">项目</label>
+          <select id="project-select" style="max-width:260px" onchange="switchProject(this.value)"></select>
+          <span style="flex:1"></span>
+          <button class="btn" id="btn-new">新建流水线</button>
+        </div>
+      </div>
+
+      <div class="grid cols-2">
+        <section class="card">
+          <h2>流水线定义</h2>
+          <div id="pipeline-list"><div class="empty">加载中…</div></div>
+        </section>
+        <section class="card">
+          <h2>最近运行</h2>
+          <div id="run-list"><div class="empty">选择一条流水线查看运行历史</div></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- 运行详情视图 -->
+    <div id="view-run" style="display:none">
+      <div class="card">
+        <div class="row spread">
+          <div class="row">
+            <button class="btn secondary small" onclick="showList()">← 返回</button>
+            <h2 style="margin:0 0 0 10px" id="run-title">流水线运行</h2>
+            <span id="run-badge"></span>
+          </div>
+          <div class="row">
+            <button class="btn secondary small" id="btn-run-refresh">刷新</button>
+            <button class="btn danger small" id="btn-run-cancel" style="display:none">取消运行</button>
+          </div>
+        </div>
+        <div class="row mt" id="run-summary"></div>
+        <div class="mt">
+          <label>阶段时间轴（按顺序执行，实时状态与耗时）</label>
+          <div class="timeline" id="timeline"><div class="empty">加载中…</div></div>
+        </div>
+        <div class="grid cols-2 mt">
+          <div>
+            <label>流水线日志</label>
+            <div class="pipeline-log" id="pipeline-log">—</div>
+          </div>
+          <div>
+            <label>阶段构建（点击查看用例明细与实时日志）</label>
+            <div id="stage-builds"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 编辑视图 -->
+    <div id="view-edit" style="display:none">
+      <div class="card">
+        <div class="row spread">
+          <h2 style="margin:0" id="edit-title">新建流水线</h2>
+          <button class="btn secondary small" onclick="showList()">取消返回</button>
+        </div>
+        <div class="grid cols-2 mt">
+          <div><label>流水线名称 *</label><input type="text" id="p-name"></div>
+          <div><label>描述</label><input type="text" id="p-desc"></div>
+        </div>
+
+        <div class="row spread mt">
+          <h3 style="margin:0">阶段编排（自上而下顺序执行）</h3>
+          <div class="row">
+            <button class="btn small secondary" onclick="addStage('static')">+ 静态检查</button>
+            <button class="btn small secondary" onclick="addStage('suite')">+ 用例阶段</button>
+            <button class="btn small secondary" onclick="addStage('report')">+ 报告阶段</button>
+          </div>
+        </div>
+        <div id="stage-editor" class="mt"></div>
+
+        <div class="row mt">
+          <button class="btn" id="btn-save">保存流水线</button>
+          <span class="muted" style="font-size:12.5px">提示：每个执行阶段可绑定不同环境，按顺序即可实现 dev 先跑、staging 后跑。</span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("pipelines");
+
+let projectId = null;
+let pipelines = [];
+let suites = [];
+let environments = [];
+let staticChecks = [];
+let editingId = null;
+let editStages = [];
+let currentRunId = null;
+let pollTimer = null;
+
+async function init() {
+  const params = new URLSearchParams(location.search);
+  projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
+  const meta = await api("/api/static-checks");
+  staticChecks = meta.checks || [];
+  await reloadBase();
+  if (params.get("run_id")) openRun(params.get("run_id"));
+}
+
+async function switchProject(id) {
+  projectId = id;
+  showList();
+  await reloadBase();
+}
+
+async function reloadBase() {
+  if (!projectId) return;
+  const [p, s, e] = await Promise.all([
+    api(`/api/projects/${projectId}/pipelines`),
+    api(`/api/projects/${projectId}/suites`),
+    api(`/api/projects/${projectId}/environments`),
+  ]);
+  pipelines = p.pipelines || [];
+  suites = s.suites || [];
+  environments = e.environments || [];
+  renderPipelines();
+  renderRuns();
+}
+
+/* ---------------- 流水线列表 ---------------- */
+function renderPipelines() {
+  const host = $("#pipeline-list");
+  if (!pipelines.length) {
+    host.innerHTML = '<div class="empty">还没有流水线，点击右上角「新建流水线」。</div>';
+    return;
+  }
+  host.innerHTML = pipelines.map(p => {
+    const chips = (p.stages || []).map((st, i) => {
+      const envName = st.env_name ? `<span class="env">@${esc(st.env_name)}</span>` : "";
+      const policy = st.on_failure === "continue"
+        ? '<span class="tag" style="font-size:11px">失败继续</span>' : "";
+      return `<span class="stage-chip"><strong>${i + 1}. ${esc(st.name)}</strong>
+        <span class="muted">${STAGE_TYPE_LABELS[st.type] || st.type}</span>${envName}${policy}</span>`;
+    }).join('<span class="arrow">→</span>');
+    const last = p.last_run;
+    return `<div class="pipe-item">
+      <div class="row spread">
+        <div class="row"><strong>${esc(p.name)}</strong>
+          ${last ? statusBadge(last.status) : '<span class="tag">未运行</span>'}</div>
+        <div class="row">
+          <button class="btn small green" onclick="runPipeline('${p.id}')">▶ 运行</button>
+          <button class="btn small secondary" onclick="editPipeline('${p.id}')">编辑</button>
+          <button class="btn small danger" onclick="delPipeline('${p.id}')">删除</button>
+        </div>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin:4px 0">${esc(p.description || "")}</div>
+      <div>${chips}</div>
+      ${last ? `<div class="muted mono" style="font-size:12px;margin-top:6px">
+        最近运行 ${fmtTime(last.created_at)} · 耗时 ${fmtDur(last.duration)}
+        <a href="javascript:openRun('${last.id}')">查看详情</a></div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+async function renderRuns(pipelineId) {
+  const host = $("#run-list");
+  if (!pipelines.length) { host.innerHTML = '<div class="empty">暂无流水线</div>'; return; }
+  const pid = pipelineId || pipelines[0].id;
+  const d = await api(`/api/projects/${projectId}/pipeline-runs?pipeline_id=${pid}&limit=20`);
+  const runs = d.runs || [];
+  if (!runs.length) { host.innerHTML = '<div class="empty">该流水线还没有运行记录</div>'; return; }
+  host.innerHTML = runs.map(r => `
+    <div class="row spread" style="padding:9px 4px;border-bottom:1px solid var(--border)">
+      <div class="row">${statusBadge(r.status)}
+        <span class="muted mono" style="font-size:12px">${fmtTime(r.created_at)} · ${fmtDur(r.duration)}</span>
+      </div>
+      <a href="javascript:openRun('${r.id}')">详情</a>
+    </div>`).join("");
+}
+
+async function runPipeline(id) {
+  const btn = event.target;
+  setLoading(btn, true, "运行中…");
+  try {
+    const r = await api(`/api/pipelines/${id}/run`, { method: "POST", body: { trigger: "manual" } });
+    toast("流水线已触发");
+    openRun(r.id);
+  } catch (e) { toast(e.message, "error"); }
+  setLoading(btn, false);
+}
+
+async function delPipeline(id) {
+  if (!confirm("确认删除该流水线？历史运行记录保留。")) return;
+  await api(`/api/pipelines/${id}`, { method: "DELETE" });
+  toast("已删除");
+  reloadBase();
+}
+
+/* ---------------- 阶段编辑器 ---------------- */
+function editPipeline(id) {
+  const p = pipelines.find(x => x.id === id);
+  if (!p) return;
+  editingId = id;
+  $("#edit-title").textContent = "编辑流水线";
+  $("#p-name").value = p.name || "";
+  $("#p-desc").value = p.description || "";
+  editStages = JSON.parse(JSON.stringify(p.stages || []));
+  $("#view-list").style.display = "none";
+  $("#view-run").style.display = "none";
+  $("#view-edit").style.display = "block";
+  renderStageEditor();
+}
+
+function addStage(type) {
+  if (type === "report" && editStages.some(s => s.type === "report")) {
+    return toast("一条流水线只能有一个报告阶段", "error");
+  }
+  // 报告阶段永远追加到末尾；新执行阶段插在已有报告阶段之前
+  const base = {
+    id: "stage_" + Math.random().toString(36).slice(2, 10),
+    name: type === "static" ? "静态检查" : type === "report" ? "生成报告" : "用例阶段",
+    type, on_failure: "abort", env_id: null, suite_id: null,
+    checks: staticChecks.map(c => c.key),
+  };
+  if (type === "suite" && suites[0]) {
+    base.suite_id = suites[0].id;
+    base.name = suites[0].name;
+  }
+  if (type !== "report" && environments[0]) base.env_id = environments[0].id;
+  const reportIdx = editStages.findIndex(s => s.type === "report");
+  if (type === "report" || reportIdx < 0) editStages.push(base);
+  else editStages.splice(reportIdx, 0, base);
+  renderStageEditor();
+}
+
+function moveStage(idx, delta) {
+  const j = idx + delta;
+  if (j < 0 || j >= editStages.length) return;
+  // 报告阶段固定最后，不参与换位
+  if (editStages[idx].type === "report" || editStages[j].type === "report") return;
+  [editStages[idx], editStages[j]] = [editStages[j], editStages[idx]];
+  renderStageEditor();
+}
+
+function removeStage(idx) { editStages.splice(idx, 1); renderStageEditor(); }
+
+function updateStage(idx, field, value) {
+  if (field === "type") return; // 类型不允许原地改，删掉重建
+  editStages[idx][field] = value;
+  if (field === "suite_id") {
+    const s = suites.find(x => x.id === value);
+    if (s && (!editStages[idx].name || editStages[idx].name === "用例阶段"))
+      editStages[idx].name = s.name;
+  }
+  renderStageEditor();
+}
+
+function toggleCheck(idx, key, checked) {
+  const cur = new Set(editStages[idx].checks || []);
+  if (checked) cur.add(key); else cur.delete(key);
+  editStages[idx].checks = [...cur];
+}
+
+function renderStageEditor() {
+  const host = $("#stage-editor");
+  if (!editStages.length) {
+    host.innerHTML = '<div class="empty">还没有阶段，用上方按钮添加「静态检查 / 用例阶段 / 报告阶段」。</div>';
+    return;
+  }
+  const envOptions = (selected) =>
+    '<option value="">— 默认环境 —</option>' +
+    environments.map(e => `<option value="${e.id}" ${e.id===selected?"selected":""}>${esc(e.name)}</option>`).join("");
+
+  host.innerHTML = editStages.map((st, idx) => {
+    let body = "";
+    if (st.type === "suite") {
+      body = `<div class="grid cols-2">
+        <div><label>绑定套件 *</label>
+          <select onchange="updateStage(${idx},'suite_id',this.value)">
+            <option value="">— 选择套件 —</option>
+            ${suites.map(s => `<option value="${s.id}" ${s.id===st.suite_id?"selected":""}>${esc(s.name)}（${s.case_count} 例）</option>`).join("")}
+          </select></div>
+        <div><label>执行环境</label>
+          <select onchange="updateStage(${idx},'env_id',this.value)">${envOptions(st.env_id)}</select></div>
+      </div>`;
+    } else if (st.type === "static") {
+      body = `<div class="grid cols-2">
+        <div><label>检查环境（配置类检查需要）</label>
+          <select onchange="updateStage(${idx},'env_id',this.value)">${envOptions(st.env_id)}</select></div>
+        <div><label>检查项</label>
+          <div class="check-grid">${staticChecks.map(c => `
+            <label><input type="checkbox" ${ (st.checks||[]).includes(c.key)?"checked":""}
+              onchange="toggleCheck(${idx},'${c.key}',this.checked)">${esc(c.name)}</label>`).join("")}</div>
+        </div>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:4px">${esc(staticChecks.map(c=>c.desc).join("；"))}</div>`;
+    } else {
+      body = '<div class="muted" style="font-size:13px">报告阶段自动汇总此前各阶段构建报告，只能放在最后，无需绑定环境与套件。</div>';
+    }
+    return `<div class="stage-row">
+      <div class="row spread">
+        <div class="row">
+          <span class="ord">${idx + 1}</span>
+          <input type="text" value="${esc(st.name)}" style="max-width:220px"
+            onchange="updateStage(${idx},'name',this.value)">
+          <span class="tag">${STAGE_TYPE_LABELS[st.type]}</span>
+          ${st.type !== "report" ? `<label style="font-weight:400;font-size:13px;margin-left:8px">失败策略
+            <select style="max-width:150px" onchange="updateStage(${idx},'on_failure',this.value)">
+              <option value="abort" ${st.on_failure==="abort"?"selected":""}>直接中止</option>
+              <option value="continue" ${st.on_failure==="continue"?"selected":""}>继续跑并标记</option>
+            </select></label>` : ""}
+        </div>
+        <div class="row">
+          <button class="btn small secondary" onclick="moveStage(${idx},-1)" ${idx===0?"disabled":""}>↑</button>
+          <button class="btn small secondary" onclick="moveStage(${idx},1)" ${idx===editStages.length-1?"disabled":""}>↓</button>
+          <button class="btn small danger" onclick="removeStage(${idx})">删除</button>
+        </div>
+      </div>
+      <div class="mt">${body}</div>
+    </div>`;
+  }).join("");
+}
+
+$("#btn-new").onclick = () => {
+  editingId = null;
+  $("#edit-title").textContent = "新建流水线";
+  $("#p-name").value = ""; $("#p-desc").value = "";
+  editStages = [];
+  $("#view-list").style.display = "none";
+  $("#view-run").style.display = "none";
+  $("#view-edit").style.display = "block";
+  renderStageEditor();
+};
+
+$("#btn-save").onclick = async () => {
+  const name = $("#p-name").value.trim();
+  if (!name) return toast("请输入流水线名称", "error");
+  if (!editStages.length) return toast("至少配置一个阶段", "error");
+  if (editStages.some(s => s.type === "suite" && !s.suite_id))
+    return toast("存在用例阶段未绑定套件", "error");
+  const body = { name, description: $("#p-desc").value, stages: editStages };
+  try {
+    if (editingId) {
+      await api(`/api/pipelines/${editingId}`, { method: "PUT", body });
+      toast("已保存");
+    } else {
+      const r = await api(`/api/projects/${projectId}/pipelines`, { method: "POST", body });
+      editingId = r.id;
+      toast("流水线已创建");
+    }
+  } catch (e) { return toast(e.message, "error"); }
+  await reloadBase();
+  showList();
+};
+
+/* ---------------- 运行详情 ---------------- */
+function showList() {
+  stopPoll();
+  currentRunId = null;
+  $("#view-edit").style.display = "none";
+  $("#view-run").style.display = "none";
+  $("#view-list").style.display = "block";
+  renderRuns();
+}
+
+async function openRun(runId) {
+  currentRunId = runId;
+  $("#view-list").style.display = "none";
+  $("#view-edit").style.display = "none";
+  $("#view-run").style.display = "block";
+  await pollRun();
+  stopPoll();
+  pollTimer = setInterval(pollRun, 1200);
+}
+
+function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+async function pollRun() {
+  if (!currentRunId) return;
+  let r;
+  try { r = await api(`/api/pipeline-runs/${currentRunId}`); }
+  catch (e) { stopPoll(); return; }
+
+  const live = ["pending", "running"].includes(r.status);
+  if (!live) stopPoll();
+
+  $("#run-title").textContent = r.pipeline_name || "流水线运行";
+  $("#run-badge").innerHTML = statusBadge(r.status);
+  $("#btn-run-cancel").style.display = live ? "inline-flex" : "none";
+
+  const totalStages = (r.stages || []).length;
+  const liveDur = r.started_at ? (live ? Date.now() / 1000 - r.started_at : r.duration) : 0;
+  $("#run-summary").innerHTML = `
+    <span class="muted" style="font-size:13px">
+      触发 <strong>${esc(r.trigger || "manual")}</strong> · 开始 ${fmtTime(r.started_at)} · 总耗时
+      <strong class="mono">${fmtDur(liveDur)}</strong>
+    </span>
+    <span class="tag" style="background:#e7f6ec;color:var(--green)">通过 ${r.passed_stages||0}</span>
+    <span class="tag" style="background:#fdecec;color:var(--red)">失败 ${r.failed_stages||0}</span>
+    <span class="tag">跳过 ${r.skipped_stages||0}</span>
+    <span class="muted" style="font-size:12.5px">阶段 ${totalStages} 个</span>`;
+
+  renderTimeline(r, live);
+  renderStageBuilds(r);
+  $("#pipeline-log").textContent = (r.logs || []).join("\n") || "暂无日志";
+  $("#pipeline-log").scrollTop = $("#pipeline-log").scrollHeight;
+}
+
+function renderTimeline(r, live) {
+  const nowTs = Date.now() / 1000;
+  const host = $("#timeline");
+  host.innerHTML = (r.stages || []).map(st => {
+    const running = st.status === "running";
+    const dur = running && st.started_at ? nowTs - st.started_at : st.duration;
+    const done = st.total || 0;
+    const ratio = done ? (st.passed || 0) / done : 0;
+    // continue 策略下的失败用警示色（不阻断流水线），与 abort 型失败区分
+    const warn = st.status === "failed" && st.on_failure === "continue";
+    const visual = warn ? "warning" : st.status;
+    const gateClass = st.status === "passed" ? "gate-passed"
+      : warn ? "gate-warning"
+      : (["failed", "cancelled"].includes(st.status) ? "gate-failed" : "");
+    const envLine = st.env_id ? `<div>环境：<span class="mono">${esc(envName(st.env_id))}</span></div>` : "";
+    const target = st.type === "suite" ? `套件：${esc(suiteName(st.suite_id))}`
+      : st.type === "static" ? `检查项：${(st.checks||[]).length} 类`
+      : "汇总各阶段报告";
+    return `<div class="tl-node ${gateClass}">
+      <div class="tl-card ${visual}">
+        <div class="tl-head"><span class="tl-dot ${visual}"></span>
+          <span class="tl-name">${esc(st.name)}</span></div>
+        <div class="tl-meta">
+          <div>${STAGE_TYPE_LABELS[st.type] || st.type} ${statusBadge(st.status)}</div>
+          <div>${target}</div>${envLine}
+          <div>失败策略：${FAILURE_POLICY_LABELS[st.on_failure] || st.on_failure}</div>
+          ${done ? `<div>通过 ${st.passed||0}/${done} · 失败 ${st.failed||0}</div>
+            <div class="tl-stage-bar"><i class="${(st.failed||0)>0?'fail':''}" style="width:${Math.round(ratio*100)}%"></i></div>` : ""}
+          <div class="${running?'tl-duration live':'tl-duration'}">${running ? "运行中 " : "耗时 "}${fmtDur(dur)}</div>
+          ${st.message ? `<div class="muted" style="font-size:11.5px">${esc(st.message)}</div>` : ""}
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderStageBuilds(r) {
+  const host = $("#stage-builds");
+  const links = (r.stages || []).filter(s => s.build_id);
+  if (!links.length) { host.innerHTML = '<div class="muted" style="font-size:13px">暂无执行阶段构建</div>'; return; }
+  host.innerHTML = links.map(s => `
+    <div class="row spread" style="padding:8px 4px;border-bottom:1px solid var(--border)">
+      <div class="row">${statusBadge(s.status)}<strong style="font-size:13.5px">${esc(s.name)}</strong></div>
+      <a href="/page/monitor.html?project_id=${r.project_id}&build_id=${s.build_id}">用例明细 / 日志 →</a>
+    </div>`).join("");
+}
+
+function envName(id) { const e = environments.find(x => x.id === id); return e ? e.name : id; }
+function suiteName(id) { const s = suites.find(x => x.id === id); return s ? s.name : id; }
+
+$("#btn-run-cancel").onclick = async () => {
+  if (!currentRunId || !confirm("确认取消该流水线运行？")) return;
+  try { await api(`/api/pipeline-runs/${currentRunId}/cancel`, { method: "POST" }); toast("已请求取消"); }
+  catch (e) { toast(e.message, "error"); }
+};
+$("#btn-run-refresh").onclick = pollRun;
+
+init();
+</script>
+</body>
+</html>

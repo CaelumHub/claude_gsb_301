@@ -85,6 +85,12 @@ def create_app(data_root: str | None = None) -> Flask:
                 seeded["project"]["id"], seeded["suite_id"], trigger="auto_seed")
         except Exception:  # noqa: BLE001
             pass
+        try:
+            pipeline = registry.store("pipelines").get(seeded["pipeline_id"])
+            if pipeline:
+                scheduler.submit_pipeline(pipeline, trigger="auto_seed")
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- 调度器生命周期 ----------------------------------------------------
     scheduler.start()

@@ -72,10 +72,18 @@ async function init() {
   const params = new URLSearchParams(location.search);
   projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
   await loadBuilds();
-  // 自动选中最近一个运行中的构建
-  const running = builds.find(b => b.status === "running");
-  if (running) selectBuild(running.id);
-  else if (builds[0]) selectBuild(builds[0].id);
+  // 自动选中最近一个运行中的构建；URL 带 build_id 时优先定位该构建
+  const focus = new URLSearchParams(location.search).get("build_id")
+    || localStorage.getItem("focus_build");
+  if (focus) {
+    localStorage.removeItem("focus_build");
+    if (builds.some(b => b.id === focus)) selectBuild(focus);
+  }
+  if (!currentBuild) {
+    const running = builds.find(b => b.status === "running");
+    if (running) selectBuild(running.id);
+    else if (builds[0]) selectBuild(builds[0].id);
+  }
 }
 
 async function switchProject(id) { projectId = id; currentBuild = null; stopPoll(); await loadBuilds(); }
@@ -91,9 +99,11 @@ async function loadBuilds() {
   host.innerHTML = list.map(b => {
     const total = b.total || 0, done = (b.passed||0)+(b.failed||0)+(b.error||0)+(b.timeout||0)+(b.skipped||0);
     const ratio = total ? done/total : 0;
+    const kindTag = b.pipeline_run_id
+      ? `<span class="tag" style="font-size:11px">流水线阶段${b.kind === "static" ? " · 静态检查" : ""}</span>` : "";
     return `<div class="build-item ${b.id===currentBuild?'active':''}" onclick="selectBuild('${b.id}')">
       <div class="row spread">
-        <div class="row"><strong>${esc(b.name||b.id)}</strong>${statusBadge(b.status)}</div>
+        <div class="row"><strong>${esc(b.name||b.id)}</strong>${kindTag}${statusBadge(b.status)}</div>
         <span class="muted mono" style="font-size:12px">${fmtTime(b.created_at)}</span>
       </div>
       <div class="mt" style="font-size:12px;color:var(--text-muted)">通过 ${b.passed||0} / 共 ${total}
@@ -123,6 +133,7 @@ async function poll() {
     $("#live-title").textContent = b.name || b.id;
     const total = b.total || 0, done = (b.passed||0)+(b.failed||0)+(b.error||0)+(b.timeout||0)+(b.skipped||0);
     $("#live-meta").innerHTML = `
+      ${b.pipeline_run_id ? `<div class="mt"><a href="/page/pipelines.html?project_id=${b.project_id}&run_id=${b.pipeline_run_id}">← 返回所属流水线运行</a></div>` : ""}
       <div class="row mt">${statusBadge(b.status)}
         <span class="muted" style="font-size:13px">通过 <strong>${b.passed||0}</strong> / 失败 <strong style="color:var(--red)">${(b.failed||0)+(b.error||0)+(b.timeout||0)}</strong> / 共 ${total}</span>
         <span class="muted mono" style="font-size:12px">触发: ${esc(b.trigger||'manual')} · ${fmtTime(b.started_at)}</span>

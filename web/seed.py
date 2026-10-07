@@ -98,9 +98,9 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         {"action": "assert", "type": "equals", "actual": "${result}", "expected": 14, "name": "结果等于 14"},
         {"action": "assert", "type": "between", "actual": "${result}", "expected": [10, 20], "name": "结果在 10~20"},
     ])
-    c8 = _case("正则断言", "P3", ["unit"], [
+    c8 = _case("版本号正则断言", "P3", ["unit"], [
         {"action": "set", "key": "text", "value": "release-2.31.0", "name": "设置文本"},
-        {"action": "assert", "type": "regex", "actual": "${text}", "expected": r"^\d+\.\d+", "name": "匹配版本号"},
+        {"action": "assert", "type": "regex", "actual": "${text}", "expected": r"\d+\.\d+\.\d+", "name": "匹配语义化版本号"},
     ])
 
     suite = {
@@ -114,6 +114,50 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "created_at": time.time(),
     }
     registry.store("suites").insert(suite)
+
+    # 为流水线准备的分阶段套件
+    suite_unit = {
+        "id": new_id("suite"), "project_id": pid,
+        "name": "单元测试集", "description": "纯逻辑 / 断言类用例",
+        "group": "unit", "env_id": env["id"],
+        "case_ids": [c7, c8], "created_at": time.time(),
+    }
+    suite_api = {
+        "id": new_id("suite"), "project_id": pid,
+        "name": "接口回归集", "description": "核心接口回归（dev / staging 各跑一遍）",
+        "group": "api", "env_id": env["id"],
+        "case_ids": [c1, c2, c3, c4], "created_at": time.time(),
+    }
+    registry.store("suites").insert(suite_unit)
+    registry.store("suites").insert(suite_api)
+
+    # 标准回归流水线：静态检查 -> 单元测试 -> 接口回归(dev) -> 接口回归(staging) -> 报告
+    # 预发环境失败策略为 continue：预发不稳时流水线继续走完，但结果会被标记。
+    pipeline = {
+        "id": new_id("pipe"), "project_id": pid,
+        "name": "标准回归流水线",
+        "description": "先静态检查、再单元测试、再接口回归；开发环境先跑，预发后跑。",
+        "stages": [
+            {"id": new_id("stage"), "name": "静态检查", "type": "static",
+             "env_id": env["id"], "on_failure": "abort",
+             "checks": ["case_enabled", "case_empty", "case_timeout",
+                        "case_dangerous", "case_variable", "suite_empty",
+                        "suite_dangling", "env_config"]},
+            {"id": new_id("stage"), "name": "单元测试", "type": "suite",
+             "suite_id": suite_unit["id"], "env_id": env["id"],
+             "on_failure": "abort"},
+            {"id": new_id("stage"), "name": "接口回归 · dev", "type": "suite",
+             "suite_id": suite_api["id"], "env_id": env["id"],
+             "on_failure": "abort"},
+            {"id": new_id("stage"), "name": "接口回归 · staging", "type": "suite",
+             "suite_id": suite_api["id"], "env_id": env2["id"],
+             "on_failure": "continue"},
+            {"id": new_id("stage"), "name": "生成报告", "type": "report",
+             "env_id": None, "on_failure": "continue"},
+        ],
+        "created_at": time.time(),
+    }
+    registry.store("pipelines").insert(pipeline)
 
     registry.store("schedules").insert({
         "id": new_id("sch"),
@@ -131,7 +175,8 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "type": "webhook",
         "name": "CI Webhook",
         "config": {"url": "https://example.com/hooks/ci"},
-        "events": ["build.finished", "build.failed"],
+        "events": ["build.finished", "build.failed",
+                   "pipeline.finished", "pipeline.failed"],
     })
     notify_mgr.create(pid, {
         "type": "email",
@@ -140,4 +185,5 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "events": ["build.failed"],
     })
 
-    return {"project": proj, "env_id": env["id"], "suite_id": suite["id"]}
+    return {"project": proj, "env_id": env["id"], "suite_id": suite["id"],
+            "pipeline_id": pipeline["id"]}

@@ -17,6 +17,8 @@ from flask import Blueprint, current_app, jsonify, request
 
 from engine import new_id
 from engine.executor import TestExecutor
+from engine.models import (STAGE_FAILURE_POLICIES, STAGE_TYPES)
+from engine.staticcheck import CHECK_MAP, DEFAULT_CHECKS
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -686,6 +688,192 @@ def test_integration(integration_id: str):
 @api.get("/projects/<project_id>/events")
 def list_events(project_id: str):
     return jsonify({"events": _notify().events(project_id)})
+
+
+# ---------------------------------------------------------------------------
+# 测试流水线：定义（阶段编排）+ 运行（阶段闸门）
+# ---------------------------------------------------------------------------
+
+def _normalize_stages(stages) -> tuple[Optional[list], Optional[str]]:
+    """校验并归一化流水线阶段定义。"""
+    if not isinstance(stages, list) or not stages:
+        return None, "至少配置一个阶段"
+    out = []
+    seen_report = False
+    for i, raw in enumerate(stages):
+        if not isinstance(raw, dict):
+            return None, f"第 {i + 1} 个阶段格式不正确"
+        stype = raw.get("type", "suite")
+        if stype not in STAGE_TYPES:
+            return None, f"阶段 {i + 1} 类型无效: {stype}"
+        policy = raw.get("on_failure", "abort")
+        if policy not in STAGE_FAILURE_POLICIES:
+            return None, f"阶段 {i + 1} 失败策略无效: {policy}"
+        stage = {
+            "id": raw.get("id") or new_id("stage"),
+            "name": (raw.get("name") or "").strip() or f"阶段 {i + 1}",
+            "type": stype,
+            "on_failure": policy,
+            "env_id": raw.get("env_id") or None,
+            "suite_id": raw.get("suite_id") or None,
+            "checks": raw.get("checks") or [],
+        }
+        if stype == "suite" and not stage["suite_id"]:
+            return None, f"阶段「{stage['name']}」必须绑定一个测试套件"
+        if stype == "static":
+            bad = [c for c in stage["checks"] if c not in CHECK_MAP]
+            if bad:
+                return None, f"阶段「{stage['name']}」含未知检查项: {bad}"
+        if stype == "report":
+            if seen_report:
+                return None, "一条流水线只能有一个报告阶段"
+            seen_report = True
+        out.append(stage)
+    # 报告阶段必须在最后（它本身是收尾动作，后面不应再有执行阶段）
+    for i, stage in enumerate(out):
+        if stage["type"] == "report" and i != len(out) - 1:
+            return None, "报告阶段只能放在流水线最后"
+    return out, None
+
+
+def _attach_stage_meta(pipeline: dict) -> dict:
+    """给流水线定义附上环境名 / 套件名，便于列表直接展示。"""
+    env_mgr = _env_mgr()
+    suites_store = _store("suites")
+    for stage in pipeline.get("stages", []):
+        env = env_mgr.get(stage["env_id"]) if stage.get("env_id") else None
+        suite = suites_store.get(stage["suite_id"]) if stage.get("suite_id") else None
+        stage["env_name"] = env.get("name") if env else None
+        stage["suite_name"] = suite.get("name") if suite else None
+    return pipeline
+
+
+@api.get("/projects/<project_id>/pipelines")
+def list_pipelines(project_id: str):
+    pipelines = _store("pipelines").query(
+        where=[("project_id", "eq", project_id)], order_by="created_at", order="desc")
+    for p in pipelines:
+        _attach_stage_meta(p)
+        recent = _store("pipeline_runs").query(
+            where=[("pipeline_id", "eq", p["id"])], order_by="created_at",
+            order="desc", limit=1)
+        p["last_run"] = {k: recent[0].get(k) for k in
+                         ("id", "status", "duration", "created_at")} if recent else None
+    return jsonify({"pipelines": pipelines})
+
+
+@api.post("/projects/<project_id>/pipelines")
+def create_pipeline(project_id: str):
+    if _store("projects").get(project_id) is None:
+        return _err("项目不存在", 404)
+    data = _payload()
+    name = (data.get("name") or "").strip()
+    if not name:
+        return _err("流水线名称不能为空")
+    stages, err = _normalize_stages(data.get("stages"))
+    if err:
+        return _err(err)
+    pipeline = {
+        "id": new_id("pipe"),
+        "project_id": project_id,
+        "name": name,
+        "description": data.get("description", ""),
+        "stages": stages,
+        "created_at": time.time(),
+    }
+    _store("pipelines").insert(pipeline)
+    return jsonify(_attach_stage_meta(pipeline))
+
+
+@api.get("/pipelines/<pipeline_id>")
+def get_pipeline(pipeline_id: str):
+    pipeline = _store("pipelines").get(pipeline_id)
+    if pipeline is None:
+        return _err("流水线不存在", 404)
+    return jsonify(_attach_stage_meta(pipeline))
+
+
+@api.put("/pipelines/<pipeline_id>")
+def update_pipeline(pipeline_id: str):
+    pipeline = _store("pipelines").get(pipeline_id)
+    if pipeline is None:
+        return _err("流水线不存在", 404)
+    data = _payload()
+    patch: dict = {}
+    if "name" in data:
+        if not (data.get("name") or "").strip():
+            return _err("流水线名称不能为空")
+        patch["name"] = data["name"]
+    if "description" in data:
+        patch["description"] = data["description"]
+    if "stages" in data:
+        stages, err = _normalize_stages(data["stages"])
+        if err:
+            return _err(err)
+        patch["stages"] = stages
+    patch["updated_at"] = time.time()
+    updated = _store("pipelines").update(pipeline_id, patch)
+    return jsonify(_attach_stage_meta(updated))
+
+
+@api.delete("/pipelines/<pipeline_id>")
+def delete_pipeline(pipeline_id: str):
+    _store("pipelines").delete(pipeline_id)
+    return jsonify({"ok": True})
+
+
+@api.get("/projects/<project_id>/pipeline-runs")
+def list_pipeline_runs(project_id: str):
+    pipeline_id = request.args.get("pipeline_id")
+    where = [("project_id", "eq", project_id)]
+    if pipeline_id:
+        where.append(("pipeline_id", "eq", pipeline_id))
+    runs = _store("pipeline_runs").query(where=where, order_by="created_at",
+                                         order="desc",
+                                         limit=request.args.get("limit", 30, type=int))
+    return jsonify({"runs": runs})
+
+
+@api.get("/pipeline-runs/<run_id>")
+def get_pipeline_run(run_id: str):
+    run = _store("pipeline_runs").get(run_id)
+    if run is None:
+        return _err("流水线运行不存在", 404)
+    return jsonify(run)
+
+
+@api.post("/pipelines/<pipeline_id>/run")
+def run_pipeline(pipeline_id: str):
+    pipeline = _store("pipelines").get(pipeline_id)
+    if pipeline is None:
+        return _err("流水线不存在", 404)
+    data = _payload()
+    result = _scheduler().submit_pipeline(
+        pipeline, trigger=data.get("trigger", "manual"),
+        env_overrides=data.get("env_overrides"))
+    if "id" not in result:
+        return _err(result.get("error", "提交流水线失败"))
+    return jsonify(result)
+
+
+@api.post("/pipeline-runs/<run_id>/cancel")
+def cancel_pipeline_run(run_id: str):
+    result = _scheduler().cancel_pipeline(run_id)
+    if "error" in result:
+        return _err(result["error"], 404)
+    return jsonify(result)
+
+
+@api.get("/pipeline-runs/running")
+def list_running_pipelines():
+    return jsonify({"running": _scheduler().running_pipelines()})
+
+
+@api.get("/static-checks")
+def list_static_checks():
+    """静态检查清单（供流水线编辑页勾选）。"""
+    return jsonify({"checks": [dict(c) for c in CHECK_MAP.values()],
+                    "defaults": DEFAULT_CHECKS})
 
 
 # ---------------------------------------------------------------------------
